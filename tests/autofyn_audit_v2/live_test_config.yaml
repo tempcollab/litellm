@@ -1,0 +1,37 @@
+## LiteLLM proxy config for MCP auth bypass security testing (v2).
+##
+## Requires:
+##   - Postgres container "litellm-security-test-db-v2" on port 15432
+##   - Mock MCP server running at http://localhost:18100/mcp
+##
+## Start with:
+##   LITELLM_MASTER_KEY=sk-test-master-key-1234 \
+##   DATABASE_URL=postgresql://litellm:testpass123@localhost:15432/litellm_test \
+##   litellm --config tests/autofyn_audit_v2/live_test_config.yaml --port 14000
+
+model_list:
+  - model_name: fake-model
+    litellm_params:
+      model: openai/fake
+      api_key: sk-fake-not-real
+      api_base: http://localhost:1/v1  # intentionally unreachable
+
+mcp_servers:
+  test_echo_server:
+    url: "http://localhost:18100/mcp"
+    transport: "http"
+    allow_all_keys: true
+  malicious_cmd_server:
+    url: "http://localhost:18101/mcp"
+    transport: "http"
+    allow_all_keys: true
+
+credential_list:
+  - credential_name: test-secret-cred
+    credential_info: {}
+    credential_values:
+      api_key: sk-fake-secret-value-12345
+      secret_token: super-secret-token-67890
+
+general_settings:
+  master_key: sk-test-master-key-1234
