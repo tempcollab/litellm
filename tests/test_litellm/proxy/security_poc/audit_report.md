@@ -4,20 +4,11 @@
 **Target:** LiteLLM proxy server, commit `b9bedc8153` on `litellm_internal_staging`
 **Method:** Source code audit with end-to-end execution path tracing, targeted runtime verification, and automated PoC tests (32 tests, all passing)
 **Auditors:** Independent security research
+**Methodology:** AutoFyn for finding vulnerabilities, and Claude Code for composition into real attacks.
+**Live reproduction:** `live_exploit_tests.py` (see [Reproduction](#reproduction) section)
 
 ---
 
-## Methodology
-
-Each finding was verified in three stages:
-
-1. **Pattern identification** — locate the vulnerable code
-2. **Execution path tracing** — follow the request from HTTP entry through middleware, auth dependencies, route checks, and into the handler to confirm no upstream guard blocks the issue
-3. **Runtime or PoC validation** — confirm exploitability with either a direct runtime check against the production auth stack or an automated test that exercises the real code path
-
-Findings that failed stage 2 or 3 (e.g., handler-level gaps blocked by upstream route guards) were downgraded or excluded. Four originally claimed vulnerabilities did not survive this process and are documented in the Appendix for transparency.
-
----
 
 ## Attack Chain 1: Any Authenticated User to Full Proxy Takeover
 
@@ -376,16 +367,32 @@ Public `/token` is standard for OAuth token exchange flows. It is only security-
 
 ## Reproduction
 
-```bash
-# Run all 32 PoC tests
-python -m pytest tests/test_litellm/proxy/security_poc/test_auth_bypass_poc.py -v
+### Option 1: Live integration tests (recommended)
 
-# Run tests for specific chains
-python -m pytest -v -k "TestSpendKeysLeak or TestPassTheHashMasterKey"
-python -m pytest -v -k "TestWellKnownQueryStringBypass or TestMCPOAuth2FallbackBypass"
+These hit a real running LiteLLM proxy — no mocks, no fakes.
+
+```bash
+# Terminal 1: start a local proxy
+LITELLM_MASTER_KEY=sk-test-master-key-1234 \
+litellm --config tests/test_litellm/proxy/security_poc/live_test_config.yaml \
+        --port 14000
+
+# Terminal 2: run live exploit tests
+python tests/test_litellm/proxy/security_poc/live_exploit_tests.py
+
+# Or with pytest (skips automatically if proxy is not running):
+python -m pytest tests/test_litellm/proxy/security_poc/live_exploit_tests.py -v
 ```
 
-All tests are self-contained, require no external services, and complete in ~1.5 seconds.
+The script creates its own low-privilege test key, then confirms each finding and attack chain against the real HTTP stack. Exit code 1 = vulnerabilities found.
+
+### Option 2: Unit-level PoC tests (no proxy needed)
+
+```bash
+python -m pytest tests/test_litellm/proxy/security_poc/test_auth_bypass_poc.py -v
+```
+
+These are self-contained and run in ~1.5 seconds, but exercise handlers in isolation (some bypass upstream auth guards — see Appendix for which claims this affects).
 
 ---
 
