@@ -83,12 +83,13 @@ if docker info > /dev/null 2>&1; then
     # Remove stale container if exists
     docker rm -f "$DB_CONTAINER" > /dev/null 2>&1 || true
 
-    echo "Starting $DB_CONTAINER on network $DOCKER_NETWORK"
+    DB_PORT=15432
+    echo "Starting $DB_CONTAINER on port $DB_PORT"
     docker run -d --name "$DB_CONTAINER" \
-        --network "$DOCKER_NETWORK" \
         -e POSTGRES_PASSWORD="$DB_PASS" \
         -e POSTGRES_DB="$DB_NAME" \
         -e POSTGRES_USER="$DB_USER" \
+        -p "${DB_PORT}:5432" \
         postgres:16-alpine > /dev/null
 
     echo -n "Waiting for Postgres..."
@@ -105,10 +106,8 @@ if docker info > /dev/null 2>&1; then
         echo -n "."
     done
 
-    # Get the container's IP on the shared network
-    DB_IP=$(docker inspect "$DB_CONTAINER" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
-    echo "Postgres IP: $DB_IP"
-    DATABASE_URL="postgresql://${DB_USER}:${DB_PASS}@${DB_IP}:5432/${DB_NAME}"
+    echo "Postgres on localhost:$DB_PORT"
+    DATABASE_URL="postgresql://${DB_USER}:${DB_PASS}@localhost:${DB_PORT}/${DB_NAME}"
 else
     echo "WARNING: Docker not available — skipping Postgres."
     DATABASE_URL=""
@@ -120,7 +119,7 @@ echo ""
 echo "=== Step 1.5: Start mock MCP server (port $MOCK_MCP_PORT) ==="
 
 cd "$REPO_ROOT"
-python3 "$SCRIPT_DIR/mock_mcp_server.py" --port "$MOCK_MCP_PORT" \
+uv run python "$SCRIPT_DIR/mock_mcp_server.py" --port "$MOCK_MCP_PORT" \
     > /tmp/mock_mcp_server.log 2>&1 &
 MOCK_MCP_PID=$!
 
@@ -164,7 +163,7 @@ echo ""
 echo "=== Step 1.6: Start malicious MCP server (port $MALICIOUS_MCP_PORT) ==="
 
 cd "$REPO_ROOT"
-python3 "$SCRIPT_DIR/malicious_mcp_server.py" --port "$MALICIOUS_MCP_PORT" \
+uv run python "$SCRIPT_DIR/malicious_mcp_server.py" --port "$MALICIOUS_MCP_PORT" \
     > /tmp/malicious_mcp_server.log 2>&1 &
 MALICIOUS_MCP_PID=$!
 
@@ -209,12 +208,10 @@ cd "$REPO_ROOT"
 
 LITELLM_MASTER_KEY="$MASTER_KEY" \
 DATABASE_URL="${DATABASE_URL:-}" \
-python3 -c "
-import sys
-sys.argv = ['litellm', '--config', '$SCRIPT_DIR/live_test_config.yaml', '--port', '$PROXY_PORT']
-from litellm.proxy.proxy_cli import run_server
-run_server(standalone_mode=True)
-" > /tmp/litellm_security_test_proxy_v2.log 2>&1 &
+uv run litellm \
+    --config "$SCRIPT_DIR/live_test_config.yaml" \
+    --port "$PROXY_PORT" \
+    > /tmp/litellm_security_test_proxy_v2.log 2>&1 &
 PROXY_PID=$!
 
 echo -n "Waiting for proxy (PID $PROXY_PID)..."
@@ -247,7 +244,7 @@ echo "=== Step 3a: Run MCP auth bypass exploit tests ==="
 echo ""
 
 MCP_EXIT=0
-python3 "$SCRIPT_DIR/live_exploit_tests.py" || MCP_EXIT=$?
+uv run python "$SCRIPT_DIR/live_exploit_tests.py" || MCP_EXIT=$?
 
 echo ""
 if [ "$MCP_EXIT" -eq 1 ]; then
@@ -274,7 +271,7 @@ echo "=== Step 3b: Run IDOR and missing-authorization exploit tests ==="
 echo ""
 
 IDOR_EXIT=0
-python3 "$SCRIPT_DIR/live_idor_exploit_tests.py" || IDOR_EXIT=$?
+uv run python "$SCRIPT_DIR/live_idor_exploit_tests.py" || IDOR_EXIT=$?
 
 echo ""
 if [ "$IDOR_EXIT" -eq 1 ]; then
@@ -298,7 +295,7 @@ echo "=== Step 3d: Run Chain-B — Zero-Auth MCP Execution + Infrastructure Reco
 echo ""
 
 CHAIN_B_EXIT=0
-python3 "$SCRIPT_DIR/exploit_chain_b.py" || CHAIN_B_EXIT=$?
+uv run python "$SCRIPT_DIR/exploit_chain_b.py" || CHAIN_B_EXIT=$?
 
 echo ""
 if [ "$CHAIN_B_EXIT" -eq 1 ]; then
@@ -322,7 +319,7 @@ echo "=== Step 3e: Run Chain-C — Any User → Cross-Tenant Data Breach + SSRF 
 echo ""
 
 CHAIN_C_EXIT=0
-python3 "$SCRIPT_DIR/exploit_chain_c.py" || CHAIN_C_EXIT=$?
+uv run python "$SCRIPT_DIR/exploit_chain_c.py" || CHAIN_C_EXIT=$?
 
 echo ""
 if [ "$CHAIN_C_EXIT" -eq 1 ]; then
@@ -346,7 +343,7 @@ echo "=== Step 3f: Run Chain-B-RCE — Zero-Auth MCP → Full Remote Code Execut
 echo ""
 
 CHAIN_B_RCE_EXIT=0
-python3 "$SCRIPT_DIR/exploit_chain_b_rce.py" || CHAIN_B_RCE_EXIT=$?
+uv run python "$SCRIPT_DIR/exploit_chain_b_rce.py" || CHAIN_B_RCE_EXIT=$?
 
 echo ""
 if [ "$CHAIN_B_RCE_EXIT" -eq 1 ]; then
