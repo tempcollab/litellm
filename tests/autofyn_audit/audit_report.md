@@ -44,7 +44,7 @@
 
 ### Privilege escalation
 
-`internal_user` is a non-admin role: "can login, view/create/delete their own keys, view their spend" (`_types.py:104`). They should not be able to rotate the master key. But they can — `/key/regenerate` is in `key_management_routes` (`_types.py:520`) which `internal_user` can access (`_types.py:653`), and the handler performs no admin role check before allowing master key rotation.
+`internal_user` is a non-admin role defined as: "can login, view/create/delete **their own keys**, view their spend" (`_types.py:104`). The role description (`_types.py:148`) repeats: "view/create/delete their own keys, view their own spend." Master key rotation is not listed — it is an admin operation. Other admin-only handlers enforce this explicitly (e.g. `mcp_management_endpoints.py:1217`: `if PROXY_ADMIN != user_api_key_dict.user_role: raise 403`). But `/key/regenerate` has no such check (`key_management_endpoints.py:3882-3939`) — any `internal_user` can rotate the master key.
 
 `spend_tracking_utils.py:55-69` — `_is_master_key()` compares against both plaintext and `hash_token()`:
 
