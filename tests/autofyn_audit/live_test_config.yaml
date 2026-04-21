@@ -1,0 +1,22 @@
+## Minimal LiteLLM proxy config for security testing.
+##
+## Requires: docker container "litellm-security-test-db" running on port 15432
+##
+## Start with:
+##   LITELLM_MASTER_KEY=sk-test-master-key-1234 \
+##   DATABASE_URL=postgresql://litellm:testpass123@localhost:15432/litellm_test \
+##   litellm --config tests/test_litellm/proxy/security_poc/live_test_config.yaml --port 14000
+
+model_list:
+  - model_name: fake-model
+    litellm_params:
+      model: openai/fake
+      api_key: sk-fake-not-real
+      api_base: http://localhost:1/v1  # intentionally unreachable
+
+general_settings:
+  master_key: sk-test-master-key-1234
+  database_url: postgresql://litellm:testpass123@localhost:15432/litellm_test
+
+litellm_settings:
+  callbacks: ["prometheus"]
