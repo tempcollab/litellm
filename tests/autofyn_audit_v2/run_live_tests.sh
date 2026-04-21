@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+#
+# End-to-end MCP auth bypass exploit test runner for LiteLLM proxy (v2).
+#
+# This script:
+#   1.   Starts a dedicated Postgres container on the same Docker network
+#   1.5. Starts the mock MCP server (port 18100)
+#   2.   Starts a LiteLLM proxy against Postgres (port 14000)
+#   3.   Runs the live MCP auth bypass exploit tests
+#   4.   Tears everything down
+#
+# Prerequisites: pip-installed litellm[proxy], docker
+#
+# Usage:
+#   chmod +x tests/autofyn_audit_v2/run_live_tests.sh
+#   ./tests/autofyn_audit_v2/run_live_tests.sh
+
+set -euo pipefail
+
+export PATH="$HOME/.local/bin:$PATH"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+DB_CONTAINER="litellm-security-test-db-v2"
+DB_USER=litellm
+DB_PASS=testpass123
+DB_NAME=litellm_test
+DOCKER_NETWORK="autofyn_default"
+
+MOCK_MCP_PORT=18100
+PROXY_PORT=14000
+MASTER_KEY="sk-test-master-key-1234"
+
+PROXY_PID=""
+MOCK_MCP_PID=""
+DOCKER_AVAILABLE=false
+DB_IP=""
+
+# ── Cleanup ──────────────────────────────────────────────────────────────────
+
+cleanup() {
+    echo ""
+    echo "=== Cleanup ==="
+
+    if [ -n "$PROXY_PID" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
+        echo "Stopping proxy (PID $PROXY_PID)..."
+        kill "$PROXY_PID" 2>/dev/null || true
+        wait "$PROXY_PID" 2>/dev/null || true
+    fi
+
+    if [ -n "$MOCK_MCP_PID" ] && kill -0 "$MOCK_MCP_PID" 2>/dev/null; then
+        echo "Stopping mock MCP server (PID $MOCK_MCP_PID)..."
+        kill "$MOCK_MCP_PID" 2>/dev/null || true
+        wait "$MOCK_MCP_PID" 2>/dev/null || true
+    fi
+
+    if [ "$DOCKER_AVAILABLE" = true ]; then
+        if docker ps -q -f name="$DB_CONTAINER" | grep -q .; then
+            echo "Stopping and removing $DB_CONTAINER..."
+            docker rm -f "$DB_CONTAINER" > /dev/null 2>&1 || true
+        fi
+    fi
+
+    echo "Done."
+}
+trap cleanup EXIT
+
+# ── Step 1: Start Postgres ──────────────────────────────────────────────────
+
+echo "=== Step 1: Start Postgres ==="
+
+if docker info > /dev/null 2>&1; then
+    DOCKER_AVAILABLE=true
+
+    # Remove stale container if exists
+    docker rm -f "$DB_CONTAINER" > /dev/null 2>&1 || true
+
+    echo "Starting $DB_CONTAINER on network $DOCKER_NETWORK"
+    docker run -d --name "$DB_CONTAINER" \
+        --network "$DOCKER_NETWORK" \
+        -e POSTGRES_PASSWORD="$DB_PASS" \
+        -e POSTGRES_DB="$DB_NAME" \
+        -e POSTGRES_USER="$DB_USER" \
+        postgres:16-alpine > /dev/null
+
+    echo -n "Waiting for Postgres..."
+    for i in $(seq 1 30); do
+        if docker exec "$DB_CONTAINER" pg_isready -U "$DB_USER" > /dev/null 2>&1; then
+            echo " ready (${i}s)"
+            break
+        fi
+        if [ "$i" -eq 30 ]; then
+            echo " TIMEOUT"
+            exit 1
+        fi
+        sleep 1
+        echo -n "."
+    done
+
+    # Get the container's IP on the shared network
+    DB_IP=$(docker inspect "$DB_CONTAINER" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+    echo "Postgres IP: $DB_IP"
+    DATABASE_URL="postgresql://${DB_USER}:${DB_PASS}@${DB_IP}:5432/${DB_NAME}"
+else
+    echo "WARNING: Docker not available — skipping Postgres."
+    DATABASE_URL=""
+fi
+
+# ── Step 1.5: Start mock MCP server ──────────────────────────────────────────
+
+echo ""
+echo "=== Step 1.5: Start mock MCP server (port $MOCK_MCP_PORT) ==="
+
+cd "$REPO_ROOT"
+python3 "$SCRIPT_DIR/mock_mcp_server.py" --port "$MOCK_MCP_PORT" \
+    > /tmp/mock_mcp_server.log 2>&1 &
+MOCK_MCP_PID=$!
+
+echo -n "Waiting for mock MCP server (PID $MOCK_MCP_PID)..."
+for i in $(seq 1 20); do
+    if python3 -c "
+import socket, sys
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect(('127.0.0.1', $MOCK_MCP_PORT))
+    s.close()
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; then
+        echo " ready (${i}s)"
+        break
+    fi
+    if ! kill -0 "$MOCK_MCP_PID" 2>/dev/null; then
+        echo " CRASHED"
+        echo "Mock MCP server log:"
+        cat /tmp/mock_mcp_server.log
+        exit 1
+    fi
+    if [ "$i" -eq 20 ]; then
+        echo " TIMEOUT"
+        echo "Mock MCP server log:"
+        cat /tmp/mock_mcp_server.log
+        exit 1
+    fi
+    sleep 1
+    echo -n "."
+done
+
+# ── Step 2: Start LiteLLM proxy ──────────────────────────────────────────────
+
+echo ""
+echo "=== Step 2: Start LiteLLM proxy (port $PROXY_PORT) ==="
+
+cd "$REPO_ROOT"
+
+LITELLM_MASTER_KEY="$MASTER_KEY" \
+DATABASE_URL="${DATABASE_URL:-}" \
+python3 -c "
+import sys
+sys.argv = ['litellm', '--config', '$SCRIPT_DIR/live_test_config.yaml', '--port', '$PROXY_PORT']
+from litellm.proxy.proxy_cli import run_server
+run_server(standalone_mode=True)
+" > /tmp/litellm_security_test_proxy_v2.log 2>&1 &
+PROXY_PID=$!
+
+echo -n "Waiting for proxy (PID $PROXY_PID)..."
+for i in $(seq 1 120); do
+    if curl -sf "http://localhost:${PROXY_PORT}/health" \
+         -H "Authorization: Bearer ${MASTER_KEY}" > /dev/null 2>&1; then
+        echo " ready (${i}s)"
+        break
+    fi
+    if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+        echo " CRASHED"
+        echo "Last 40 lines of proxy log:"
+        tail -40 /tmp/litellm_security_test_proxy_v2.log
+        exit 1
+    fi
+    if [ "$i" -eq 120 ]; then
+        echo " TIMEOUT"
+        echo "Last 40 lines of proxy log:"
+        tail -40 /tmp/litellm_security_test_proxy_v2.log
+        exit 1
+    fi
+    sleep 1
+    echo -n "."
+done
+
+# ── Step 3: Run exploit tests ─────────────────────────────────────────────────
+
+echo ""
+echo "=== Step 3: Run MCP auth bypass exploit tests ==="
+echo ""
+
+TEST_EXIT=0
+python3 "$SCRIPT_DIR/live_exploit_tests.py" || TEST_EXIT=$?
+
+echo ""
+if [ "$TEST_EXIT" -eq 1 ]; then
+    echo "=== Tests found vulnerabilities (expected — audit confirms live exploit) ==="
+elif [ "$TEST_EXIT" -eq 0 ]; then
+    echo "=== No vulnerabilities found (bypass may have been patched) ==="
+elif [ "$TEST_EXIT" -eq 2 ]; then
+    echo "=== Tests could not connect to proxy ==="
+    echo "Proxy log tail:"
+    tail -20 /tmp/litellm_security_test_proxy_v2.log
+else
+    echo "=== Tests failed with exit code $TEST_EXIT ==="
+    echo "Proxy log tail:"
+    tail -20 /tmp/litellm_security_test_proxy_v2.log
+    echo ""
+    echo "Mock MCP server log:"
+    cat /tmp/mock_mcp_server.log
+fi
+
+exit "$TEST_EXIT"
