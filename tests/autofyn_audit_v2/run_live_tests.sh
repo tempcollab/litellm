@@ -240,15 +240,63 @@ else
     tail -20 /tmp/litellm_security_test_proxy_v2.log
 fi
 
+# ── Step 3d: Run Chain-B exploit (zero-auth MCP + recon) ─────────────────────
+
+echo ""
+echo "=== Step 3d: Run Chain-B — Zero-Auth MCP Execution + Infrastructure Recon ==="
+echo ""
+
+CHAIN_B_EXIT=0
+python3 "$SCRIPT_DIR/exploit_chain_b.py" || CHAIN_B_EXIT=$?
+
+echo ""
+if [ "$CHAIN_B_EXIT" -eq 1 ]; then
+    echo "=== Step 3d: Chain-B confirmed zero-credential MCP exploit (expected — audit confirms live) ==="
+elif [ "$CHAIN_B_EXIT" -eq 0 ]; then
+    echo "=== Step 3d: Chain-B found no zero-credential vulnerabilities (bypass may have been patched) ==="
+elif [ "$CHAIN_B_EXIT" -eq 2 ]; then
+    echo "=== Step 3d: Chain-B could not connect to proxy ==="
+    echo "Proxy log tail:"
+    tail -20 /tmp/litellm_security_test_proxy_v2.log
+else
+    echo "=== Step 3d: Chain-B failed with exit code $CHAIN_B_EXIT ==="
+    echo "Proxy log tail:"
+    tail -20 /tmp/litellm_security_test_proxy_v2.log
+fi
+
+# ── Step 3e: Run Chain-C exploit (any user → cross-tenant breach + SSRF) ─────
+
+echo ""
+echo "=== Step 3e: Run Chain-C — Any User → Cross-Tenant Data Breach + SSRF ==="
+echo ""
+
+CHAIN_C_EXIT=0
+python3 "$SCRIPT_DIR/exploit_chain_c.py" || CHAIN_C_EXIT=$?
+
+echo ""
+if [ "$CHAIN_C_EXIT" -eq 1 ]; then
+    echo "=== Step 3e: Chain-C confirmed cross-tenant breach (expected — audit confirms live) ==="
+elif [ "$CHAIN_C_EXIT" -eq 0 ]; then
+    echo "=== Step 3e: Chain-C found no cross-tenant vulnerabilities (endpoints may have been patched) ==="
+elif [ "$CHAIN_C_EXIT" -eq 2 ]; then
+    echo "=== Step 3e: Chain-C could not connect to proxy or setup failed ==="
+    echo "Proxy log tail:"
+    tail -20 /tmp/litellm_security_test_proxy_v2.log
+else
+    echo "=== Step 3e: Chain-C failed with exit code $CHAIN_C_EXIT ==="
+    echo "Proxy log tail:"
+    tail -20 /tmp/litellm_security_test_proxy_v2.log
+fi
+
 # ── Aggregate exit code ───────────────────────────────────────────────────────
 
-# Exit 1 if either test suite confirmed vulnerabilities; preserve exit 2 for
-# infrastructure failures when neither suite found vulnerabilities.
-if [ "$MCP_EXIT" -eq 1 ] || [ "$IDOR_EXIT" -eq 1 ]; then
+# Exit 1 if any test suite confirmed vulnerabilities; preserve exit 2 for
+# infrastructure failures when no suite found vulnerabilities.
+if [ "$MCP_EXIT" -eq 1 ] || [ "$IDOR_EXIT" -eq 1 ] || [ "$CHAIN_B_EXIT" -eq 1 ] || [ "$CHAIN_C_EXIT" -eq 1 ]; then
     exit 1
-elif [ "$MCP_EXIT" -eq 2 ] || [ "$IDOR_EXIT" -eq 2 ]; then
+elif [ "$MCP_EXIT" -eq 2 ] || [ "$IDOR_EXIT" -eq 2 ] || [ "$CHAIN_B_EXIT" -eq 2 ] || [ "$CHAIN_C_EXIT" -eq 2 ]; then
     exit 2
-elif [ "$MCP_EXIT" -ne 0 ] || [ "$IDOR_EXIT" -ne 0 ]; then
+elif [ "$MCP_EXIT" -ne 0 ] || [ "$IDOR_EXIT" -ne 0 ] || [ "$CHAIN_B_EXIT" -ne 0 ] || [ "$CHAIN_C_EXIT" -ne 0 ]; then
     exit 1
 else
     exit 0
