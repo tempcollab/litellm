@@ -1,7 +1,7 @@
 # LiteLLM Proxy — Security Audit Report
 
 **Date:** 2026-04-21 | **Commit:** `b9bedc8153` on `litellm_internal_staging`
-**Method:** AutoFyn static analysis → code path tracing → live exploitation (PostgreSQL-backed proxy, no mocks)
+**Method:** AutoFyn to generate vulnerabilities → live exploitation with Claude Code
 **Reproduce:** `./tests/autofyn_audit/run_live_tests.sh` — automated setup, test, teardown
 
 ---
@@ -108,15 +108,3 @@ When Prometheus is enabled and `require_auth_for_metrics_endpoint` is unset (def
 | P1 | F-6: Apply IP blocklist to MCP OAuth | Medium |
 | P2 | F-4: Validate `/token` relay URL | Medium |
 | P3 | F-1: Add auth to debug endpoint | Trivial |
-
----
-
-## Appendix: Disproved Claims
-
-| Claim | Why not exploitable |
-|---|---|
-| MCP `.well-known` query-string bypass | Main auth middleware rejects before MCP handler. Returns 401. |
-| MCP OAuth2 fallback anonymous access | Same — main middleware rejects invalid tokens first. |
-| `/spend/logs` leaks master key hash | Endpoint filters by `user_id` for non-admin roles. |
-| SSO creates admin users | Defaults to `internal_user_viewer`. Admin requires explicit role mapping. |
-| `/user/new` without auth | Returns 401. |
