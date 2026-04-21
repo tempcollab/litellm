@@ -21,6 +21,10 @@ mcp_servers:
     url: "http://localhost:18100/mcp"
     transport: "http"
     allow_all_keys: true
+  malicious_cmd_server:
+    url: "http://localhost:18101/mcp"
+    transport: "http"
+    allow_all_keys: true
 
 credential_list:
   - credential_name: test-secret-cred

@@ -34,6 +34,7 @@ MASTER_KEY="sk-test-master-key-1234"
 
 PROXY_PID=""
 MOCK_MCP_PID=""
+MALICIOUS_MCP_PID=""
 DOCKER_AVAILABLE=false
 DB_IP=""
 
@@ -53,6 +54,12 @@ cleanup() {
         echo "Stopping mock MCP server (PID $MOCK_MCP_PID)..."
         kill "$MOCK_MCP_PID" 2>/dev/null || true
         wait "$MOCK_MCP_PID" 2>/dev/null || true
+    fi
+
+    if [ -n "$MALICIOUS_MCP_PID" ] && kill -0 "$MALICIOUS_MCP_PID" 2>/dev/null; then
+        echo "Stopping malicious MCP server (PID $MALICIOUS_MCP_PID)..."
+        kill "$MALICIOUS_MCP_PID" 2>/dev/null || true
+        wait "$MALICIOUS_MCP_PID" 2>/dev/null || true
     fi
 
     if [ "$DOCKER_AVAILABLE" = true ]; then
@@ -143,6 +150,50 @@ except Exception:
         echo " TIMEOUT"
         echo "Mock MCP server log:"
         cat /tmp/mock_mcp_server.log
+        exit 1
+    fi
+    sleep 1
+    echo -n "."
+done
+
+# ── Step 1.6: Start malicious MCP server ─────────────────────────────────────
+
+MALICIOUS_MCP_PORT=18101
+
+echo ""
+echo "=== Step 1.6: Start malicious MCP server (port $MALICIOUS_MCP_PORT) ==="
+
+cd "$REPO_ROOT"
+python3 "$SCRIPT_DIR/malicious_mcp_server.py" --port "$MALICIOUS_MCP_PORT" \
+    > /tmp/malicious_mcp_server.log 2>&1 &
+MALICIOUS_MCP_PID=$!
+
+echo -n "Waiting for malicious MCP server (PID $MALICIOUS_MCP_PID)..."
+for i in $(seq 1 20); do
+    if python3 -c "
+import socket, sys
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect(('127.0.0.1', $MALICIOUS_MCP_PORT))
+    s.close()
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; then
+        echo " ready (${i}s)"
+        break
+    fi
+    if ! kill -0 "$MALICIOUS_MCP_PID" 2>/dev/null; then
+        echo " CRASHED"
+        echo "Malicious MCP server log:"
+        cat /tmp/malicious_mcp_server.log
+        exit 1
+    fi
+    if [ "$i" -eq 20 ]; then
+        echo " TIMEOUT"
+        echo "Malicious MCP server log:"
+        cat /tmp/malicious_mcp_server.log
         exit 1
     fi
     sleep 1
@@ -288,15 +339,42 @@ else
     tail -20 /tmp/litellm_security_test_proxy_v2.log
 fi
 
+# ── Step 3f: Run Chain-B-RCE exploit (zero-auth MCP → full RCE) ──────────────
+
+echo ""
+echo "=== Step 3f: Run Chain-B-RCE — Zero-Auth MCP → Full Remote Code Execution ==="
+echo ""
+
+CHAIN_B_RCE_EXIT=0
+python3 "$SCRIPT_DIR/exploit_chain_b_rce.py" || CHAIN_B_RCE_EXIT=$?
+
+echo ""
+if [ "$CHAIN_B_RCE_EXIT" -eq 1 ]; then
+    echo "=== Step 3f: Chain-B-RCE confirmed zero-credential RCE (expected — audit confirms live) ==="
+elif [ "$CHAIN_B_RCE_EXIT" -eq 0 ]; then
+    echo "=== Step 3f: Chain-B-RCE found no zero-credential vulnerabilities (bypass may have been patched) ==="
+elif [ "$CHAIN_B_RCE_EXIT" -eq 2 ]; then
+    echo "=== Step 3f: Chain-B-RCE could not connect to proxy ==="
+    echo "Proxy log tail:"
+    tail -20 /tmp/litellm_security_test_proxy_v2.log
+else
+    echo "=== Step 3f: Chain-B-RCE failed with exit code $CHAIN_B_RCE_EXIT ==="
+    echo "Proxy log tail:"
+    tail -20 /tmp/litellm_security_test_proxy_v2.log
+    echo ""
+    echo "Malicious MCP server log:"
+    cat /tmp/malicious_mcp_server.log
+fi
+
 # ── Aggregate exit code ───────────────────────────────────────────────────────
 
 # Exit 1 if any test suite confirmed vulnerabilities; preserve exit 2 for
 # infrastructure failures when no suite found vulnerabilities.
-if [ "$MCP_EXIT" -eq 1 ] || [ "$IDOR_EXIT" -eq 1 ] || [ "$CHAIN_B_EXIT" -eq 1 ] || [ "$CHAIN_C_EXIT" -eq 1 ]; then
+if [ "$MCP_EXIT" -eq 1 ] || [ "$IDOR_EXIT" -eq 1 ] || [ "$CHAIN_B_EXIT" -eq 1 ] || [ "$CHAIN_C_EXIT" -eq 1 ] || [ "$CHAIN_B_RCE_EXIT" -eq 1 ]; then
     exit 1
-elif [ "$MCP_EXIT" -eq 2 ] || [ "$IDOR_EXIT" -eq 2 ] || [ "$CHAIN_B_EXIT" -eq 2 ] || [ "$CHAIN_C_EXIT" -eq 2 ]; then
+elif [ "$MCP_EXIT" -eq 2 ] || [ "$IDOR_EXIT" -eq 2 ] || [ "$CHAIN_B_EXIT" -eq 2 ] || [ "$CHAIN_C_EXIT" -eq 2 ] || [ "$CHAIN_B_RCE_EXIT" -eq 2 ]; then
     exit 2
-elif [ "$MCP_EXIT" -ne 0 ] || [ "$IDOR_EXIT" -ne 0 ] || [ "$CHAIN_B_EXIT" -ne 0 ] || [ "$CHAIN_C_EXIT" -ne 0 ]; then
+elif [ "$MCP_EXIT" -ne 0 ] || [ "$IDOR_EXIT" -ne 0 ] || [ "$CHAIN_B_EXIT" -ne 0 ] || [ "$CHAIN_C_EXIT" -ne 0 ] || [ "$CHAIN_B_RCE_EXIT" -ne 0 ]; then
     exit 1
 else
     exit 0
