@@ -189,26 +189,26 @@ for i in $(seq 1 120); do
     echo -n "."
 done
 
-# ── Step 3: Run exploit tests ─────────────────────────────────────────────────
+# ── Step 3a: Run MCP auth bypass exploit tests ────────────────────────────────
 
 echo ""
-echo "=== Step 3: Run MCP auth bypass exploit tests ==="
+echo "=== Step 3a: Run MCP auth bypass exploit tests ==="
 echo ""
 
-TEST_EXIT=0
-python3 "$SCRIPT_DIR/live_exploit_tests.py" || TEST_EXIT=$?
+MCP_EXIT=0
+python3 "$SCRIPT_DIR/live_exploit_tests.py" || MCP_EXIT=$?
 
 echo ""
-if [ "$TEST_EXIT" -eq 1 ]; then
-    echo "=== Tests found vulnerabilities (expected — audit confirms live exploit) ==="
-elif [ "$TEST_EXIT" -eq 0 ]; then
-    echo "=== No vulnerabilities found (bypass may have been patched) ==="
-elif [ "$TEST_EXIT" -eq 2 ]; then
-    echo "=== Tests could not connect to proxy ==="
+if [ "$MCP_EXIT" -eq 1 ]; then
+    echo "=== Step 3a: Tests found MCP vulnerabilities (expected — audit confirms live exploit) ==="
+elif [ "$MCP_EXIT" -eq 0 ]; then
+    echo "=== Step 3a: No MCP vulnerabilities found (bypass may have been patched) ==="
+elif [ "$MCP_EXIT" -eq 2 ]; then
+    echo "=== Step 3a: Tests could not connect to proxy ==="
     echo "Proxy log tail:"
     tail -20 /tmp/litellm_security_test_proxy_v2.log
 else
-    echo "=== Tests failed with exit code $TEST_EXIT ==="
+    echo "=== Step 3a: Tests failed with exit code $MCP_EXIT ==="
     echo "Proxy log tail:"
     tail -20 /tmp/litellm_security_test_proxy_v2.log
     echo ""
@@ -216,4 +216,40 @@ else
     cat /tmp/mock_mcp_server.log
 fi
 
-exit "$TEST_EXIT"
+# ── Step 3b: Run IDOR and missing-authorization exploit tests ─────────────────
+
+echo ""
+echo "=== Step 3b: Run IDOR and missing-authorization exploit tests ==="
+echo ""
+
+IDOR_EXIT=0
+python3 "$SCRIPT_DIR/live_idor_exploit_tests.py" || IDOR_EXIT=$?
+
+echo ""
+if [ "$IDOR_EXIT" -eq 1 ]; then
+    echo "=== Step 3b: Tests found IDOR/auth vulnerabilities (expected — audit confirms live exploit) ==="
+elif [ "$IDOR_EXIT" -eq 0 ]; then
+    echo "=== Step 3b: No IDOR/auth vulnerabilities found (endpoints may have been patched) ==="
+elif [ "$IDOR_EXIT" -eq 2 ]; then
+    echo "=== Step 3b: Tests could not connect to proxy or setup failed ==="
+    echo "Proxy log tail:"
+    tail -20 /tmp/litellm_security_test_proxy_v2.log
+else
+    echo "=== Step 3b: Tests failed with exit code $IDOR_EXIT ==="
+    echo "Proxy log tail:"
+    tail -20 /tmp/litellm_security_test_proxy_v2.log
+fi
+
+# ── Aggregate exit code ───────────────────────────────────────────────────────
+
+# Exit 1 if either test suite confirmed vulnerabilities; preserve exit 2 for
+# infrastructure failures when neither suite found vulnerabilities.
+if [ "$MCP_EXIT" -eq 1 ] || [ "$IDOR_EXIT" -eq 1 ]; then
+    exit 1
+elif [ "$MCP_EXIT" -eq 2 ] || [ "$IDOR_EXIT" -eq 2 ]; then
+    exit 2
+elif [ "$MCP_EXIT" -ne 0 ] || [ "$IDOR_EXIT" -ne 0 ]; then
+    exit 1
+else
+    exit 0
+fi

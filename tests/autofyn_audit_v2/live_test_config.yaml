@@ -22,5 +22,12 @@ mcp_servers:
     transport: "http"
     allow_all_keys: true
 
+credential_list:
+  - credential_name: test-secret-cred
+    credential_info: {}
+    credential_values:
+      api_key: sk-fake-secret-value-12345
+      secret_token: super-secret-token-67890
+
 general_settings:
   master_key: sk-test-master-key-1234
