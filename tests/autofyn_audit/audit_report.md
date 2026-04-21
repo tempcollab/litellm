@@ -42,13 +42,9 @@
 
 ## F-5: Pass-the-Hash Master Key Rotation
 
-### Why `internal_user` can do this
+### Privilege escalation
 
-The `internal_user` role is defined as a regular user who can "login, view/create/delete their own keys, view their spend" (`_types.py:104`). They are not expected to perform any admin operations. However, `/key/regenerate` is listed in `key_management_routes` (`_types.py:520`), which is included in `internal_user_routes` (`_types.py:653`). This grants `internal_user` access to the endpoint. The handler (`key_management_endpoints.py:3892-3896`) then skips the enterprise license check when `new_master_key` is provided, and `_is_master_key()` accepts the hash — so the operation succeeds without any admin role check.
-
-In short: the route ACL lets `internal_user` reach `/key/regenerate` (intended for their own keys), but the handler has no check that the caller is `PROXY_ADMIN` before allowing master key rotation.
-
-### The bug
+`internal_user` is a non-admin role: "can login, view/create/delete their own keys, view their spend" (`_types.py:104`). They should not be able to rotate the master key. But they can — `/key/regenerate` is in `key_management_routes` (`_types.py:520`) which `internal_user` can access (`_types.py:653`), and the handler performs no admin role check before allowing master key rotation.
 
 `spend_tracking_utils.py:55-69` — `_is_master_key()` compares against both plaintext and `hash_token()`:
 
