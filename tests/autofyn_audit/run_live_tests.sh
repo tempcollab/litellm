@@ -11,13 +11,13 @@
 # Prerequisites: docker, uv (or pip-installed litellm)
 #
 # Usage:
-#   chmod +x tests/test_litellm/proxy/security_poc/run_live_tests.sh
-#   ./tests/test_litellm/proxy/security_poc/run_live_tests.sh
+#   chmod +x tests/autofyn_audit/run_live_tests.sh
+#   ./tests/autofyn_audit/run_live_tests.sh
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 DB_CONTAINER="litellm-security-test-db"
 DB_PORT=15432
@@ -115,10 +115,22 @@ for i in $(seq 1 60); do
     echo -n "."
 done
 
-# ── Step 3: Run exploit tests ───────────────────────────────────────────────
+# ── Step 3: Seed traffic with the master key ──────────────────────────────
 
 echo ""
-echo "=== Step 3: Run live exploit tests ==="
+echo "=== Step 3: Seed master-key traffic (so /metrics has hashed_api_key labels) ==="
+curl -sf "http://localhost:${PROXY_PORT}/chat/completions" \
+     -H "Authorization: Bearer ${MASTER_KEY}" \
+     -H "Content-Type: application/json" \
+     -d '{"model":"fake-model","messages":[{"role":"user","content":"seed"}]}' \
+     > /dev/null 2>&1 || true
+sleep 2
+echo "Done."
+
+# ── Step 4: Run exploit tests ───────────────────────────────────────────────
+
+echo ""
+echo "=== Step 4: Run live exploit tests ==="
 echo ""
 
 # The test script exits 1 if vulnerabilities found (which is what we expect).
