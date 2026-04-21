@@ -5,13 +5,13 @@
 **Method:** Source code audit → execution path tracing → live exploitation against a real proxy instance
 **Auditors:** Independent security research
 **Methodology:** AutoFyn for finding vulnerabilities, Claude Code for verification and live exploitation.
-**Live reproduction:** `./tests/autofyn_audit/run_live_tests.sh` — 6 findings confirmed, 1 code-only, 2 regressions verified safe
+**Live reproduction:** `./tests/autofyn_audit/run_live_tests.sh` — 7/7 findings confirmed live, 2 regressions verified safe
 
 ---
 
 ## Summary
 
-We identified **6 live-confirmed exploitable vulnerabilities** and **1 code-confirmed vulnerability** in the LiteLLM proxy server. Two of these chain together into a **full proxy takeover requiring only network access and any low-privilege API key**.
+We identified **7 live-confirmed exploitable vulnerabilities** in the LiteLLM proxy server. Two of these chain together into a **full proxy takeover requiring only network access and any low-privilege API key**.
 
 Every finding was tested against a real LiteLLM proxy with Postgres — no mocks.
 
@@ -21,9 +21,9 @@ Every finding was tested against a real LiteLLM proxy with Postgres — no mocks
 | F-5: `_is_master_key()` accepts hash — master key rotation | Critical | Yes |
 | F-3: Unauthenticated `/metrics/` leaks master key hash | High | Yes |
 | F-2: `/spend/keys` leaks all key rows to any internal user | High | Yes |
+| F-6: MCP OAuth metadata SSRF (no private IP validation) | High | Yes |
 | F-4: Unauthenticated `/token` endpoint (SSRF amplifier) | Medium | Yes |
 | F-1: Unauthenticated `/debug/asyncio-tasks` | Low | Yes |
-| F-6: MCP OAuth metadata SSRF (no private IP validation) | High | Code only |
 
 5 additional claims from the original static analysis were **disproved** by live testing (see Appendix).
 
@@ -245,16 +245,49 @@ Reveals: database type, alerting configuration, monitoring setup.
 
 ---
 
-## F-6: MCP OAuth Metadata SSRF (Code-Confirmed)
+## F-6: MCP OAuth Metadata SSRF
 
 **Severity:** High
 **CWE:** CWE-918
-**File:** `mcp_server_manager.py:1580-1687`
-**Live confirmed:** No — requires mock malicious MCP server
+**File:** `mcp_server_manager.py:1481-1704`
+**Live confirmed:** Yes — proxy followed attacker-controlled URL to internal target
 
-`_fetch_oauth_metadata_from_resource()` and `_fetch_single_authorization_server_metadata()` fetch URLs from `WWW-Authenticate` headers with no private IP blocking or scheme validation. `IPAddressUtils` exists elsewhere in the codebase but is not applied here. Requires attacker influence over an MCP server's HTTP responses.
+When an admin registers an MCP server with `auth_type: oauth2`, the proxy performs RFC 9728 OAuth discovery. It connects to the server, expects a `401` with a `WWW-Authenticate` header, then **follows the `resource_metadata` URL from that header with no validation**.
 
-**Fix:** Add private IP blocklist and `https://` scheme restriction.
+### The vulnerability
+
+```python
+# mcp_server_manager.py:1509-1520
+resource_metadata_url, scopes = self._parse_www_authenticate_header(header_value)
+if resource_metadata_url:
+    # Fetches ANY URL the server provides — no private-IP check, no scheme check
+    authorization_servers, resource_scopes = await self._fetch_oauth_metadata_from_resource(
+        resource_metadata_url
+    )
+```
+
+`_fetch_oauth_metadata_from_resource()` (line 1591) and `_fetch_single_authorization_server_metadata()` (line 1687) make HTTP GET requests to arbitrary URLs. `IPAddressUtils` exists in the codebase but is not applied here.
+
+### Live exploit
+
+The test starts a mock HTTP server that acts as a malicious MCP server:
+
+1. Admin registers `http://attacker:PORT/mcp` as an MCP server with `auth_type: oauth2`
+2. Proxy connects → mock returns `401` + `WWW-Authenticate: Bearer resource_metadata="http://169.254.169.254/..."`
+3. Proxy fetches `http://169.254.169.254/...` — SSRF to cloud metadata service
+
+```
+  [VULNERABLE] F-6
+               Proxy fetched attacker-controlled URL http://127.0.0.1:PORT/ssrf-canary — SSRF confirmed
+```
+
+### Realistic scenario
+
+An admin adds a third-party MCP server that is compromised or malicious. The proxy's OAuth discovery makes requests to internal network addresses (cloud metadata APIs, internal services) on behalf of the attacker. This can leak cloud credentials (AWS IAM role tokens via `169.254.169.254`), probe internal services, or access other internal APIs.
+
+### Fix
+
+Add private IP blocklist and `https://` scheme restriction to `_fetch_oauth_metadata_from_resource()` and `_fetch_single_authorization_server_metadata()`. The codebase already has `IPAddressUtils` — apply it here.
 
 ---
 
@@ -275,8 +308,9 @@ F-3: metrics unauth            VULNERABLE
 F-4: token unauth              VULNERABLE
 F-5: pass-the-hash             VULNERABLE
 CHAIN-1: metrics→takeover      VULNERABLE
+F-6: MCP OAuth SSRF            VULNERABLE
 
-6/6 findings confirmed against live proxy
+7/7 findings confirmed against live proxy
 ```
 
 ---
