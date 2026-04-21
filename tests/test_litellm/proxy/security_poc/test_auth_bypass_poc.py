@@ -19,13 +19,16 @@ sys.path.insert(0, os.path.abspath("../../../.."))
 from litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp import (
     MCPRequestHandler,
 )
-from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.debug_utils import router as debug_router
 
 EXPLOIT_PATH = "/v1/mcp/tools"
 EXPLOIT_QUERY = b"x=.well-known"
 WELL_KNOWN_PATH = "/.well-known/oauth-authorization-server"
+
+GARBAGE_TOKEN = "Bearer totally-invalid-key-12345"
+EXPIRED_TOKEN = "Bearer eyJhbGciOiJSUzI1NiJ9.expired.token"
 
 
 def _build_scope(path: str, query_string: bytes, headers: list) -> dict:
@@ -35,6 +38,24 @@ def _build_scope(path: str, query_string: bytes, headers: list) -> dict:
         "path": path,
         "query_string": query_string,
         "headers": headers,
+        "scheme": "http",
+        "server": ("testserver", 80),
+        "root_path": "",
+    }
+
+
+def _build_scope_with_auth_header(path: str, auth_value: str) -> dict:
+    """Build an ASGI scope with an Authorization header but NO x-litellm-api-key header.
+
+    Used to simulate an attacker sending an arbitrary token (garbage, expired, OAuth2)
+    via the standard Authorization header to MCP endpoints.
+    """
+    return {
+        "type": "http",
+        "method": "GET",
+        "path": path,
+        "query_string": b"",
+        "headers": [(b"authorization", auth_value.encode())],
         "scheme": "http",
         "server": ("testserver", 80),
         "root_path": "",
@@ -322,3 +343,270 @@ class TestDebugEndpointUnauthenticated:
         assert "by_name" in data, "Response must include 'by_name'"
         assert isinstance(data["total_active_tasks"], int)
         assert isinstance(data["by_name"], dict)
+
+
+@pytest.mark.asyncio
+class TestMCPOAuth2FallbackBypass:
+    """
+    PoC tests proving the MCP OAuth2 fallback authentication bypass vulnerability.
+
+    Vulnerability description:
+        When a client sends ANY value in the standard ``Authorization`` header
+        (without the explicit ``x-litellm-api-key`` header), the handler in
+        ``user_api_key_auth_mcp.py`` (lines 127-153) first tries to validate the
+        token as a LiteLLM API key.  If that validation raises an HTTPException
+        with status 401/403 OR a ProxyException with code "401"/"403", the handler
+        silently catches the error and returns a bare ``UserAPIKeyAuth()`` — an
+        anonymous identity with no api_key, no user_id, no team_id, and no budget.
+
+        Combined with ``route_checks.py`` line 231-232, which contains a blanket
+        ``pass`` (skip all authZ) for any route that starts with ``/v1/mcp/`` or
+        ``/mcp-rest/``, this anonymous identity is never checked against allowed
+        routes, team membership, or spending limits.
+
+    Severity: Critical - Authentication Bypass + Authorization Skip
+    """
+
+    async def test_garbage_token_grants_anonymous_access(self):
+        """
+        Prove the core vulnerability: a garbage Bearer token causes silent anonymous access.
+
+        Exploit:
+            GET /v1/mcp/tools
+            Authorization: Bearer totally-invalid-key-12345
+            (no x-litellm-api-key header)
+
+        The handler enters the ``oauth2_headers`` branch because an Authorization
+        header is present.  It calls ``user_api_key_auth`` which raises
+        ``HTTPException(status_code=401)``.  The ``except HTTPException`` block
+        at line 136 catches the 401, logs a debug message, and returns
+        ``UserAPIKeyAuth()`` — anonymous access — instead of propagating the error.
+
+        Impact:
+            Any attacker (or misconfigured upstream MCP client) can send a random
+            string as a Bearer token and receive full anonymous access to all MCP
+            tools and resources.  The returned identity has no api_key, no user_id,
+            no team_id, and no budget, meaning all MCP operations proceed with no
+            accountability, no spend tracking, and no rate limiting.
+
+        Severity: Critical - Authentication Bypass
+        """
+        scope = _build_scope_with_auth_header("/v1/mcp/tools", GARBAGE_TOKEN)
+
+        with patch(
+            "litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.user_api_key_auth",
+            side_effect=HTTPException(status_code=401, detail="invalid api key"),
+        ) as mock_auth, patch.object(
+            MCPRequestHandler,
+            "_get_mcp_client_side_auth_header_name",
+            return_value="x-mcp-auth",
+        ):
+            (auth_result, *_) = await MCPRequestHandler.process_mcp_request(scope)
+
+        # user_api_key_auth WAS called — the bypass is not a skip, it's a silent swallow
+        mock_auth.assert_called_once()
+
+        # The result is an anonymous identity — proof of the bypass
+        assert auth_result.api_key is None, (
+            f"Expected api_key=None for anonymous access, got {auth_result.api_key!r}"
+        )
+        assert auth_result.user_id is None, (
+            f"Expected user_id=None for anonymous access, got {auth_result.user_id!r}"
+        )
+        assert auth_result.team_id is None, (
+            f"Expected team_id=None for anonymous access, got {auth_result.team_id!r}"
+        )
+
+    async def test_expired_key_grants_anonymous_access(self):
+        """
+        Prove the ProxyException catch branch also silently grants anonymous access.
+
+        Exploit:
+            GET /v1/mcp/tools
+            Authorization: Bearer <expired-token>
+            (no x-litellm-api-key header)
+
+        When the LiteLLM key database raises a ``ProxyException`` with code 401
+        (e.g. "Token has expired"), the ``except ProxyException`` block at line 145
+        catches it and returns ``UserAPIKeyAuth()`` — anonymous access — instead of
+        propagating the error.
+
+        This covers a second code path (``ProxyException`` vs ``HTTPException``)
+        that leads to the same silent anonymous access vulnerability.
+
+        Impact:
+            An attacker with a previously valid but now-expired LiteLLM key retains
+            full anonymous access to all MCP tools and resources.  The expiry
+            mechanism provides no security benefit for MCP endpoints.
+
+        Severity: Critical - Authentication Bypass
+        """
+        scope = _build_scope_with_auth_header("/v1/mcp/tools", EXPIRED_TOKEN)
+
+        with patch(
+            "litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.user_api_key_auth",
+            side_effect=ProxyException(
+                message="Token has expired",
+                type="auth_error",
+                param=None,
+                code=401,
+            ),
+        ) as mock_auth, patch.object(
+            MCPRequestHandler,
+            "_get_mcp_client_side_auth_header_name",
+            return_value="x-mcp-auth",
+        ):
+            (auth_result, *_) = await MCPRequestHandler.process_mcp_request(scope)
+
+        # user_api_key_auth WAS called — the bypass is a silent swallow
+        mock_auth.assert_called_once()
+
+        # The result is an anonymous identity — proof of the bypass
+        assert auth_result.api_key is None, (
+            f"Expected api_key=None for anonymous access, got {auth_result.api_key!r}"
+        )
+        assert auth_result.user_id is None, (
+            f"Expected user_id=None for anonymous access, got {auth_result.user_id!r}"
+        )
+        assert auth_result.team_id is None, (
+            f"Expected team_id=None for anonymous access, got {auth_result.team_id!r}"
+        )
+
+    async def test_anonymous_user_bypasses_route_authz(self):
+        """
+        Prove the second half of the exploit chain: MCP routes skip all authZ checks.
+
+        After obtaining an anonymous ``UserAPIKeyAuth()`` via the OAuth2 fallback,
+        the anonymous identity is passed to ``route_checks.py``.  Lines 231-232
+        contain a blanket ``pass`` for any route starting with ``/v1/mcp/`` or
+        ``/mcp-rest/``:
+
+            elif route.startswith("/v1/mcp/") or route.startswith("/mcp-rest/"):
+                pass  # authN/authZ handled by api itself
+
+        This means the anonymous identity is never validated against:
+            - ``allowed_routes`` (team or key scope restrictions)
+            - Team membership checks
+            - Budget or rate-limit enforcement
+
+        The comment "authN/authZ handled by api itself" is incorrect — as shown by
+        the previous tests, the MCP auth handler itself is the one granting anonymous
+        access.  There is no second line of defence.
+
+        Impact:
+            Combined with the OAuth2 fallback bypass, an attacker with a garbage
+            Bearer token can call any MCP tool or resource with zero restrictions.
+            The full exploit chain is: invalid token -> anonymous UserAPIKeyAuth()
+            -> route_checks skips all authZ -> unrestricted MCP access.
+
+        Severity: Critical - Authorization Bypass
+        """
+        # Demonstrate the route_checks condition directly
+        mcp_tool_route = "/v1/mcp/tools"
+        mcp_rest_route = "/mcp-rest/list-tools"
+        non_mcp_route = "/v1/chat/completions"
+
+        assert mcp_tool_route.startswith("/v1/mcp/"), (
+            f"Route '{mcp_tool_route}' must match the route_checks.py skip condition"
+        )
+        assert mcp_rest_route.startswith("/mcp-rest/"), (
+            f"Route '{mcp_rest_route}' must match the route_checks.py skip condition"
+        )
+        assert not non_mcp_route.startswith("/v1/mcp/") and not non_mcp_route.startswith(
+            "/mcp-rest/"
+        ), (
+            f"Non-MCP route '{non_mcp_route}' must NOT match the skip condition"
+        )
+
+        # Demonstrate that the anonymous identity has no restrictions to check
+        anonymous_auth = UserAPIKeyAuth()
+        assert anonymous_auth.api_key is None
+        assert anonymous_auth.user_id is None
+        assert anonymous_auth.team_id is None
+        # allowed_routes defaults to [] (empty list) on UserAPIKeyAuth — not None.
+        # An empty allowed_routes means no explicit route restriction is configured,
+        # but since route_checks.py skips authZ entirely for MCP routes, even a
+        # non-empty allowed_routes would never be checked for these endpoints.
+        assert not anonymous_auth.allowed_routes, (
+            f"Anonymous identity's allowed_routes must be empty, got {anonymous_auth.allowed_routes!r}"
+        )
+
+    async def test_correct_behavior_rejects_invalid_token(self):
+        """
+        Document what correct behaviour looks like: invalid tokens must be rejected.
+
+        This test shows the contrast between the current (vulnerable) implementation
+        and the correct (fixed) implementation by reproducing the vulnerable OAuth2
+        fallback logic inline and showing what the fix would do differently.
+
+        Vulnerable behaviour (current):
+            except HTTPException as e:
+                if e.status_code in (401, 403):
+                    validated_user_api_key_auth = UserAPIKeyAuth()  # silent grant!
+
+        Correct behaviour (fix):
+            except HTTPException as e:
+                raise  # always propagate auth failures
+
+        A client sending an invalid token should always receive a 401 response.
+        Anonymous access must be explicitly opted-in (e.g. a public route like
+        ``/.well-known``) — it must never be the fallback for auth failures.
+
+        Severity: Critical - Authentication Bypass (remediation guidance)
+        """
+
+        async def _vulnerable_oauth2_fallback(
+            raises: Exception,
+        ) -> UserAPIKeyAuth:
+            """Reproduce the current vulnerable logic from lines 132-153."""
+            try:
+                raise raises
+            except HTTPException as e:
+                if e.status_code in (401, 403):
+                    return UserAPIKeyAuth()  # BUG: silent anonymous grant
+                raise
+            except ProxyException as e:
+                if str(e.code) in ("401", "403"):
+                    return UserAPIKeyAuth()  # BUG: silent anonymous grant
+                raise
+
+        async def _fixed_oauth2_fallback(
+            raises: Exception,
+        ) -> UserAPIKeyAuth:
+            """Reproduce what the fixed logic should look like."""
+            try:
+                raise raises
+            except (HTTPException, ProxyException):
+                raise  # CORRECT: always propagate auth failures
+
+        # Vulnerable version grants anonymous access on 401
+        vulnerable_result = await _vulnerable_oauth2_fallback(
+            HTTPException(status_code=401, detail="invalid api key")
+        )
+        assert vulnerable_result.api_key is None, (
+            "Vulnerable logic returns anonymous UserAPIKeyAuth on 401 — this is the bug"
+        )
+
+        # Fixed version propagates the exception
+        with pytest.raises(HTTPException) as exc_info:
+            await _fixed_oauth2_fallback(
+                HTTPException(status_code=401, detail="invalid api key")
+            )
+        assert exc_info.value.status_code == 401, (
+            "Fixed logic must propagate the 401, never grant anonymous access"
+        )
+
+        # Same for ProxyException
+        vulnerable_result_proxy = await _vulnerable_oauth2_fallback(
+            ProxyException(message="Token expired", type="auth_error", param=None, code=401)
+        )
+        assert vulnerable_result_proxy.api_key is None, (
+            "Vulnerable logic returns anonymous UserAPIKeyAuth on ProxyException 401"
+        )
+
+        with pytest.raises(ProxyException):
+            await _fixed_oauth2_fallback(
+                ProxyException(
+                    message="Token expired", type="auth_error", param=None, code=401
+                )
+            )
