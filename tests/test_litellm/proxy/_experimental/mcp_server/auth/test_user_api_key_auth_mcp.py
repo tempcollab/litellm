@@ -24,6 +24,71 @@ from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 
 @pytest.mark.asyncio
 class TestMCPRequestHandler:
+    async def test_well_known_path_is_public(self):
+        """/.well-known/* in the path must bypass auth entirely."""
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/.well-known/oauth-authorization-server",
+            "query_string": b"",
+            "headers": [],
+        }
+
+        with patch(
+            "litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.user_api_key_auth",
+        ) as mock_auth:
+            (auth_result, *_) = await MCPRequestHandler.process_mcp_request(scope)
+
+        assert isinstance(auth_result, UserAPIKeyAuth)
+        mock_auth.assert_not_called()
+
+    async def test_well_known_in_query_string_does_not_bypass_auth(self):
+        """?x=.well-known must NOT bypass auth — only the path matters."""
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/v1/mcp/tools",
+            "query_string": b"x=.well-known",
+            "headers": [(b"x-litellm-api-key", b"sk-test")],
+        }
+
+        async def _allow(api_key, request):
+            return UserAPIKeyAuth(api_key=api_key, user_id="test-user")
+
+        with patch(
+            "litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.user_api_key_auth",
+            side_effect=_allow,
+        ) as mock_auth:
+            (auth_result, *_) = await MCPRequestHandler.process_mcp_request(scope)
+
+        mock_auth.assert_called_once()
+        assert auth_result.api_key == "sk-test"
+
+    async def test_well_known_in_non_path_position_does_not_bypass_auth(self):
+        """.well-known appearing only outside the path must not bypass auth."""
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/v1/mcp/tools",
+            "query_string": b"",
+            "headers": [(b"x-litellm-api-key", b"sk-test")],
+        }
+
+        async def _allow(api_key, request):
+            return UserAPIKeyAuth(api_key=api_key, user_id="test-user")
+
+        with patch(
+            "litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.user_api_key_auth",
+            side_effect=_allow,
+        ) as mock_auth:
+            (auth_result, *_) = await MCPRequestHandler.process_mcp_request(scope)
+
+        mock_auth.assert_called_once()
+        assert auth_result.api_key == "sk-test"
+
     @pytest.mark.parametrize(
         "key_servers,team_servers,expected_result,scenario",
         [
