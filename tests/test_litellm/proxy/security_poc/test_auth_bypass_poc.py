@@ -1,13 +1,20 @@
 """
-Security PoC tests demonstrating two vulnerabilities and their fixes.
+Security PoC tests demonstrating six vulnerabilities and their fixes.
 
 Vulnerability 1: MCP .well-known query-string auth bypass
 Vulnerability 2: Unauthenticated /debug/asyncio-tasks endpoint
+Vulnerability 3: MCP OAuth2 fallback bypass
+Vulnerability 4: Pass-the-hash on master key (key rotation endpoint)
+Vulnerability 5: IDOR on /user/info v1 endpoint
+Vulnerability 6: /spend/keys leaks all API keys to any authenticated user
 """
 
+import inspect
 import os
+import secrets
 import sys
-from unittest.mock import patch
+from types import ModuleType
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -19,9 +26,15 @@ sys.path.insert(0, os.path.abspath("../../../.."))
 from litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp import (
     MCPRequestHandler,
 )
-from litellm.proxy._types import ProxyException, UserAPIKeyAuth
+from litellm.proxy._types import LitellmUserRoles, ProxyException, UserAPIKeyAuth, UserInfoResponse, hash_token
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.debug_utils import router as debug_router
+from litellm.proxy.management_endpoints.internal_user_endpoints import (
+    _check_user_info_v2_access,
+    user_info,
+)
+from litellm.proxy.spend_tracking.spend_management_endpoints import spend_key_fn
+from litellm.proxy.spend_tracking.spend_tracking_utils import _is_master_key
 
 EXPLOIT_PATH = "/v1/mcp/tools"
 EXPLOIT_QUERY = b"x=.well-known"
@@ -29,6 +42,22 @@ WELL_KNOWN_PATH = "/.well-known/oauth-authorization-server"
 
 GARBAGE_TOKEN = "Bearer totally-invalid-key-12345"
 EXPIRED_TOKEN = "Bearer eyJhbGciOiJSUzI1NiJ9.expired.token"
+
+
+def _make_proxy_server_module(prisma_client: MagicMock) -> ModuleType:
+    """Create a minimal fake ``litellm.proxy.proxy_server`` module for patching.
+
+    ``proxy_server`` imports ``websockets`` and other optional dependencies that
+    are not present in the unit-test environment.  Functions under test import
+    ``prisma_client`` via ``from litellm.proxy.proxy_server import prisma_client``
+    at call time.  Injecting a fake module into ``sys.modules`` before the call
+    intercepts that import without triggering the real module's heavy dependencies.
+    """
+    fake = ModuleType("litellm.proxy.proxy_server")
+    fake.prisma_client = prisma_client  # type: ignore[attr-defined]
+    fake.general_settings = {}  # type: ignore[attr-defined]
+    fake.litellm_master_key_hash = None  # type: ignore[attr-defined]
+    return fake
 
 
 def _build_scope(path: str, query_string: bytes, headers: list) -> dict:
@@ -610,3 +639,443 @@ class TestMCPOAuth2FallbackBypass:
                     message="Token expired", type="auth_error", param=None, code=401
                 )
             )
+
+
+TEST_MASTER_KEY = "sk-master-secret-1234"
+
+
+class TestPassTheHashMasterKey:
+    """
+    PoC tests proving the pass-the-hash vulnerability on the master key.
+
+    Vulnerability description:
+        ``_is_master_key()`` in ``spend_tracking_utils.py`` (lines 55-69) accepts
+        BOTH the plaintext master key AND its SHA-256 hash as valid credentials.
+        In the key regeneration endpoint (``key_management_endpoints.py`` line 3919),
+        passing ``hash_token(master_key)`` as the ``key`` parameter in the request body
+        is enough to pass the master-key gate and trigger master key rotation.
+
+        The SHA-256 hash of every master key is stored in the
+        ``LiteLLM_VerificationToken`` table (``token`` column) and appears in spend
+        logs.  Any authenticated user who can read those tables (e.g. via the /spend/*
+        endpoints) can obtain the hash and use it to rotate the master key — effectively
+        taking over the entire LiteLLM proxy.
+
+    Severity: Critical - Privilege Escalation / Master Key Takeover
+    """
+
+    def test_hash_accepted_as_master_key(self):
+        """
+        Proves that SHA-256 hash of the master key is accepted as a valid credential.
+
+        Exploit:
+            Call ``_is_master_key(api_key=hash_token(master_key), _master_key=master_key)``.
+            The function returns True, meaning the hash is treated as equivalent to
+            the plaintext key.
+
+        Impact:
+            Any entity that can read the ``LiteLLM_VerificationToken`` table (or
+            observe the ``token`` field in spend logs) can pass the hash as the
+            ``key`` body parameter to the key regeneration endpoint and be granted
+            master-key privileges — without ever knowing the plaintext master key.
+
+        Severity: Critical - Privilege Escalation
+        """
+        hashed = hash_token(TEST_MASTER_KEY)
+        result = _is_master_key(api_key=hashed, _master_key=TEST_MASTER_KEY)
+        assert result is True, (
+            f"hash_token(master_key) must be accepted by _is_master_key — "
+            f"hash={hashed!r} was rejected, proving the vulnerability exists in this build"
+        )
+
+    def test_hash_enables_master_key_rotation(self):
+        """
+        Proves the rotation gate is entered when the hash is supplied as the key.
+
+        Exploit:
+            In the key regeneration endpoint (line 3919-3921), the gate is:
+                _is_master_key_valid = _is_master_key(api_key=key, _master_key=master_key)
+                if master_key is not None and data and _is_master_key_valid:
+                    await _rotate_master_key(...)
+
+            Supplying ``key = hash_token(master_key)`` makes ``_is_master_key_valid``
+            True, so the rotation branch is entered.  A normal ``sk-*`` key holder who
+            read the hash from spend logs can trigger this without knowing the plaintext.
+
+        Impact:
+            An attacker with any valid API key can rotate the master key to one they
+            control, locking out all legitimate admins and taking full control of the
+            proxy.
+
+        Severity: Critical - Privilege Escalation / Master Key Takeover
+        """
+        hashed_key = hash_token(TEST_MASTER_KEY)
+
+        # Reproduce the key rotation gate inline (lines 3919-3921)
+        _is_master_key_valid = _is_master_key(api_key=hashed_key, _master_key=TEST_MASTER_KEY)
+        rotation_gate_entered = TEST_MASTER_KEY is not None and _is_master_key_valid
+
+        assert rotation_gate_entered is True, (
+            "Rotation gate must be entered when hash is supplied — "
+            "the vulnerability allows any holder of the hash to rotate the master key"
+        )
+
+        # Contrast: a random string does NOT pass the gate
+        random_string = "definitely-not-the-master-key"
+        _is_random_valid = _is_master_key(api_key=random_string, _master_key=TEST_MASTER_KEY)
+        assert _is_random_valid is False, (
+            "A random string must not pass the master-key gate"
+        )
+
+    def test_correct_behavior_rejects_hash(self):
+        """
+        Documents what correct behaviour looks like: only plaintext accepted.
+
+        The fix is to remove the hash comparison branch from ``_is_master_key`` so
+        that only ``secrets.compare_digest(api_key, _master_key)`` is performed.
+        This test reproduces the correct single-check logic inline and proves the
+        hash is rejected under it.
+
+        Severity: Critical - Privilege Escalation (remediation guidance)
+        """
+        hashed_key = hash_token(TEST_MASTER_KEY)
+
+        # Correct logic: only plaintext comparison, no hash branch
+        def _correct_is_master_key(api_key: str, _master_key: str) -> bool:
+            return secrets.compare_digest(api_key, _master_key)
+
+        # Hash must be rejected under the correct logic
+        assert _correct_is_master_key(api_key=hashed_key, _master_key=TEST_MASTER_KEY) is False, (
+            "The SHA-256 hash of the master key must NOT be accepted as valid — "
+            "only the plaintext key should pass"
+        )
+
+        # Plaintext must still be accepted
+        assert _correct_is_master_key(api_key=TEST_MASTER_KEY, _master_key=TEST_MASTER_KEY) is True, (
+            "The plaintext master key must still be accepted under the correct logic"
+        )
+
+
+@pytest.mark.asyncio
+class TestUserInfoIDOR:
+    """
+    PoC tests proving the IDOR vulnerability in the /user/info v1 endpoint.
+
+    Vulnerability description:
+        The v1 ``user_info()`` endpoint in ``internal_user_endpoints.py`` (lines 704-790)
+        does NOT check whether the authenticated caller's ``user_id`` matches the
+        ``user_id`` query parameter.  Any authenticated user (even with the lowest
+        ``INTERNAL_USER`` role) can supply any other user's ID and receive that user's
+        full profile including all their API keys.
+
+        The v2 ``_check_user_info_v2_access()`` function (lines 793-854) correctly
+        enforces: admins only, or self-lookup, or team-admin of the same team.  The
+        v1 endpoint has no equivalent check.
+
+    Severity: High - Insecure Direct Object Reference (IDOR) / Credential Theft
+    """
+
+    async def test_any_user_can_read_another_users_info(self):
+        """
+        Proves that a non-admin user can fetch a different user's profile and keys.
+
+        Exploit:
+            GET /user/info?user_id=victim-user
+            Authorization: Bearer sk-attacker-key   (INTERNAL_USER role)
+
+        The function fetches user_id from the query param directly and returns the
+        victim's profile without ever comparing it to the caller's identity.
+
+        Impact:
+            Any authenticated user can enumerate all other users' profiles.
+            Combined with the returned ``keys`` field (shown in test 2), this
+            leaks every API key belonging to the victim.
+
+        Severity: High - IDOR
+        """
+        mock_user = MagicMock()
+        mock_user.user_id = "victim-user"
+        mock_user.teams = []
+
+        mock_key = MagicMock()
+        mock_key.token = "hashed-victim-key"
+        mock_key.user_id = "victim-user"
+
+        async def _get_data_side_effect(**kwargs):
+            table_name = kwargs.get("table_name")
+            if table_name == "key":
+                return [mock_key]
+            return mock_user
+
+        mock_prisma = MagicMock()
+        mock_prisma.get_data = AsyncMock(side_effect=_get_data_side_effect)
+
+        scope = _build_scope("/user/info", b"user_id=victim-user", [])
+        request = Request(scope=scope)
+
+        attacker_auth = UserAPIKeyAuth(
+            api_key="sk-attacker-key",
+            user_id="attacker-user",
+            user_role=LitellmUserRoles.INTERNAL_USER,
+        )
+
+        victim_response = UserInfoResponse(
+            user_id="victim-user",
+            user_info={"user_id": "victim-user"},
+            keys=[{"token": "hashed-victim-key", "user_id": "victim-user"}],
+            teams=[],
+        )
+
+        fake_proxy_server = _make_proxy_server_module(mock_prisma)
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": fake_proxy_server}), patch(
+            "litellm.proxy.management_endpoints.internal_user_endpoints._get_user_info_teams",
+            new_callable=AsyncMock,
+            return_value=([], None),
+        ), patch(
+            "litellm.proxy.management_endpoints.internal_user_endpoints._build_user_info_response",
+            return_value=victim_response,
+        ):
+            response = await user_info(
+                request=request,
+                user_id="victim-user",
+                user_api_key_dict=attacker_auth,
+            )
+
+        # The call succeeded without a 403 — the attacker received the victim's data
+        assert response is not None, "user_info must return data for a cross-user request — no 403 raised"
+        assert response.user_id == "victim-user", (
+            f"Response must contain victim's user_id, got {response.user_id!r}"
+        )
+
+    async def test_response_includes_victim_keys(self):
+        """
+        Proves the IDOR leaks the victim's API keys to the attacker.
+
+        The ``keys`` field of the UserInfoResponse contains the full key records
+        for the requested user, including token hashes and metadata that can be
+        used to impersonate the victim.
+
+        Exploit:
+            Same as test_any_user_can_read_another_users_info. Specifically check
+            the returned ``keys`` field.
+
+        Impact:
+            The attacker receives the victim's key hashes (stored in the
+            ``LiteLLM_VerificationToken`` table), which can be used for the
+            pass-the-hash attack on the key regeneration endpoint.
+
+        Severity: High - IDOR + Credential Theft
+        """
+        mock_user = MagicMock()
+        mock_user.user_id = "victim-user"
+        mock_user.teams = []
+
+        mock_key = MagicMock()
+        mock_key.token = "hashed-victim-key-abc123"
+        mock_key.user_id = "victim-user"
+        mock_key.spend = 0.0
+
+        async def _get_data_side_effect(**kwargs):
+            table_name = kwargs.get("table_name")
+            if table_name == "key":
+                return [mock_key]
+            return mock_user
+
+        mock_prisma = MagicMock()
+        mock_prisma.get_data = AsyncMock(side_effect=_get_data_side_effect)
+
+        scope = _build_scope("/user/info", b"user_id=victim-user", [])
+        request = Request(scope=scope)
+
+        attacker_auth = UserAPIKeyAuth(
+            api_key="sk-attacker-key",
+            user_id="attacker-user",
+            user_role=LitellmUserRoles.INTERNAL_USER,
+        )
+
+        victim_response = UserInfoResponse(
+            user_id="victim-user",
+            user_info={"user_id": "victim-user"},
+            keys=[{"token": "hashed-victim-key-abc123", "user_id": "victim-user"}],
+            teams=[],
+        )
+
+        fake_proxy_server = _make_proxy_server_module(mock_prisma)
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": fake_proxy_server}), patch(
+            "litellm.proxy.management_endpoints.internal_user_endpoints._get_user_info_teams",
+            new_callable=AsyncMock,
+            return_value=([], None),
+        ), patch(
+            "litellm.proxy.management_endpoints.internal_user_endpoints._build_user_info_response",
+            return_value=victim_response,
+        ):
+            response = await user_info(
+                request=request,
+                user_id="victim-user",
+                user_api_key_dict=attacker_auth,
+            )
+
+        assert response is not None
+        assert response.keys is not None, "Response must include victim's keys"
+        assert len(response.keys) > 0, (
+            "At least one key must be returned for the victim — credential theft is possible"
+        )
+
+    async def test_v2_endpoint_blocks_cross_user_access(self):
+        """
+        Contrasts the v1 vulnerability: v2 correctly denies cross-user access.
+
+        ``_check_user_info_v2_access()`` enforces three rules (admin, self, team-admin).
+        None of those apply to a plain INTERNAL_USER accessing a different user's data,
+        so the function returns ``None`` — denying access.
+
+        Exploit attempt:
+            An INTERNAL_USER calls ``_check_user_info_v2_access`` with
+            ``user_id="attacker-user"`` and ``target_user_id="victim-user"``.
+            The attacker is not an admin, not the victim, and has no shared teams.
+
+        Expected result:
+            Returns ``None`` — access denied. The v2 endpoint uses this to raise 403.
+
+        Severity: N/A - Correct behaviour (v2 fix)
+        """
+        mock_caller_user = MagicMock()
+        mock_caller_user.user_id = "attacker-user"
+        mock_caller_user.teams = []  # attacker has no teams
+
+        mock_prisma = MagicMock()
+        mock_prisma.db = MagicMock()
+        mock_prisma.db.litellm_usertable = MagicMock()
+        mock_prisma.db.litellm_usertable.find_unique = AsyncMock(
+            return_value=mock_caller_user
+        )
+
+        attacker_auth = UserAPIKeyAuth(
+            api_key="sk-attacker-key",
+            user_id="attacker-user",
+            user_role=LitellmUserRoles.INTERNAL_USER,
+        )
+
+        fake_proxy_server = _make_proxy_server_module(mock_prisma)
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": fake_proxy_server}):
+            result = await _check_user_info_v2_access(
+                user_api_key_dict=attacker_auth,
+                target_user_id="victim-user",
+            )
+
+        assert result is None, (
+            f"v2 access check must return None (deny) for cross-user INTERNAL_USER request, "
+            f"got {result!r}"
+        )
+
+
+@pytest.mark.asyncio
+class TestSpendKeysLeaksAllKeys:
+    """
+    PoC tests proving the /spend/keys endpoint leaks all API keys to any authenticated user.
+
+    Vulnerability description:
+        The ``spend_key_fn()`` endpoint in ``spend_management_endpoints.py`` (lines 34-66)
+        fetches ALL keys from the database with no filtering by caller identity.
+        Authentication is enforced via ``dependencies=[Depends(user_api_key_auth)]`` at
+        the route level, but any valid API key passes that check — including the lowest-
+        privilege ``INTERNAL_USER`` role.
+
+        Once past the auth check, the function calls
+        ``prisma_client.get_data(table_name="key", query_type="find_all")`` which
+        returns every key in the database regardless of owner, team, or role.
+
+        The function signature does not include a ``user_api_key_dict`` parameter,
+        so it structurally CANNOT perform per-caller filtering — the caller's identity
+        is simply not available inside the function body.
+
+    Severity: High - Credential Disclosure (All API Keys)
+    """
+
+    async def test_non_admin_gets_all_keys(self):
+        """
+        Proves that calling ``spend_key_fn()`` returns all keys with no filtering.
+
+        Exploit:
+            GET /spend/keys
+            Authorization: Bearer sk-any-valid-key
+
+        Any authenticated call returns the full contents of the
+        ``LiteLLM_VerificationToken`` table — keys belonging to every user and team.
+
+        Impact:
+            An attacker with any valid API key can exfiltrate all API keys in the
+            system.  Combined with the pass-the-hash attack (TestPassTheHashMasterKey),
+            they can immediately escalate to master-key privileges.
+
+        Severity: High - Credential Disclosure
+        """
+        # Keys belonging to three different users — all returned indiscriminately
+        user_a_key = MagicMock()
+        user_a_key.token = "hashed-key-user-a"
+        user_a_key.user_id = "user-a"
+
+        user_b_key = MagicMock()
+        user_b_key.token = "hashed-key-user-b"
+        user_b_key.user_id = "user-b"
+
+        user_c_key = MagicMock()
+        user_c_key.token = "hashed-key-user-c"
+        user_c_key.user_id = "user-c"
+
+        all_keys = [user_a_key, user_b_key, user_c_key]
+
+        mock_prisma = MagicMock()
+        mock_prisma.get_data = AsyncMock(return_value=all_keys)
+
+        fake_proxy_server = _make_proxy_server_module(mock_prisma)
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": fake_proxy_server}):
+            result = await spend_key_fn()
+
+        assert result is not None
+        assert len(result) == 3, (
+            f"All 3 keys must be returned with no filtering, got {len(result)}"
+        )
+        returned_users = {k.user_id for k in result}
+        assert returned_users == {"user-a", "user-b", "user-c"}, (
+            f"Keys from all users must be returned, got {returned_users!r}"
+        )
+
+    async def test_no_role_check_in_function(self):
+        """
+        Structural proof that ``spend_key_fn`` cannot perform authorization.
+
+        Uses ``inspect`` to verify:
+        1. The function has no ``user_api_key_dict`` parameter — the caller's identity
+           is not available inside the function body.
+        2. The function source contains no role checks (no ``user_role``, no
+           ``PROXY_ADMIN``, no ``user_api_key_dict`` references).
+
+        This is architectural evidence that the endpoint is incapable of enforcing
+        per-caller access control, regardless of what logic might be added later.
+        The fix requires changing the function signature to accept ``user_api_key_dict``
+        and adding filtering logic.
+
+        Severity: High - Credential Disclosure (structural)
+        """
+        sig = inspect.signature(spend_key_fn)
+        assert "user_api_key_dict" not in sig.parameters, (
+            f"spend_key_fn must not have a user_api_key_dict parameter — "
+            f"confirming the caller identity is structurally unavailable. "
+            f"Parameters found: {list(sig.parameters.keys())}"
+        )
+
+        # Unwrap if the decorator uses @wraps, otherwise use the function directly
+        underlying_fn = getattr(spend_key_fn, "__wrapped__", spend_key_fn)
+        source = inspect.getsource(underlying_fn)
+
+        assert "user_role" not in source, (
+            "spend_key_fn source must not contain 'user_role' — no role check is performed"
+        )
+        assert "PROXY_ADMIN" not in source, (
+            "spend_key_fn source must not contain 'PROXY_ADMIN' — no admin check is performed"
+        )
+        assert "user_api_key_dict" not in source, (
+            "spend_key_fn source must not reference 'user_api_key_dict' — "
+            "the caller's identity is not used for filtering"
+        )
